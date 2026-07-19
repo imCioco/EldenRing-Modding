@@ -49,10 +49,18 @@ struct State {
     std::string open_key_label = "Insert";
     std::string open_pad_label = "L3+R3";
 
-    // Escape hatch ([overlay] focus_input = 1): restore the old focus-taking
-    // input mode. Default is focus-free -- the overlay never deactivates the
-    // game, avoiding frame-gen re-init freezes on open/close.
-    bool focus_input = false;
+    // Whole-overlay scale: 0 = auto (derived from the game's resolution, so 4K
+    // and ultrawide canvases get a proportionally larger panel), else a forced
+    // 0.5-2.0 from [overlay] ui_scale.
+    float ui_scale = 0.0f;
+
+    // Saved panel geometry ([panel] in the .ini, canvas pixels). w/h <= 0 =
+    // nothing saved yet -> the overlay uses its default placement. The overlay
+    // writes the live values back every open frame; saved on menu close.
+    float panel_x = -1.0f;
+    float panel_y = -1.0f;
+    float panel_w = 0.0f;
+    float panel_h = 0.0f;
 
     bool save_requested = false;           // overlay asked to persist to the .ini
 

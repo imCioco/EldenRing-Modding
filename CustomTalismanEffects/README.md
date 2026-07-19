@@ -18,7 +18,9 @@ Press **Insert** (keyboard) or **L3 + R3** (controller) to open a Dear ImGui pan
 
 **Already-equipped talismans.** Talismans you have physically equipped are detected (by their effect being live on your character) and shown in **blue**. With stacking **off** they're also greyed out and locked — their effect is already active, so there's nothing to add. With stacking **on** they stay blue but remain toggleable. Unequip the talisman in-game and the row unlocks within about half a second.
 
-Changes made in the overlay are written back to `CustomTalismanEffects.ini` (on **Save to .ini** or when you close the panel), so they persist across sessions.
+Changes made in the overlay are written back to `CustomTalismanEffects.ini` (on **Save to .ini** or when you close the panel), so they persist across sessions — including where you dragged the panel and how big you made it.
+
+The panel scales itself to your resolution (1440p and above get proportionally larger text and controls, 1080p keeps the authored size), so it stays readable on 4K displays. Force a specific size with `[overlay] ui_scale` if you prefer.
 
 **Effect descriptions on hover.** When you point at a talisman with the mouse (or land on it with the controller's stick/d-pad), its effect is shown — as a mouse tooltip and in a detail pane at the bottom of the panel. The descriptions are **baked into the DLL** (no extra file to ship), stored in `src/talisman_names.hpp` as the third field of each entry:
 
@@ -29,7 +31,7 @@ Changes made in the overlay are written back to `CustomTalismanEffects.ini` (on 
 
 Base-game talismans are pre-filled with the game's own effect wording. The 39 Shadow of the Erdtree talismans ship **blank** — to fill them (e.g. from [Fextralife](https://eldenring.wiki.fextralife.com/Talismans), ideally with the % numbers), just edit the `effect` string in `src/talisman_names.hpp` and rebuild. Re-running `python tools/gen_talisman_data.py` **preserves your hand-edited effect text** (only ids/names are regenerated from Paramdex); don't change the `id` or `name`.
 
-The overlay draws itself by hooking the game's DX12 swapchain (the same technique as the ERR-MapForGoblins overlay); it grabs the vtable pointers from a throwaway device, so there's no hard-coded address to maintain.
+The overlay composites itself into the game's own D3D12 backbuffer just before the real `Present`, using a private command list, descriptor heap and fence — the game keeps owning its window, device, command queue, swapchain and `Present` call, and the mod never creates a second one of any of them. Discovery happens by observing `CreateSwapChain`/`CreateSwapChainForHwnd` (hooked early, on the worker thread, before anything slow) and shadowing that swapchain's vtable per instance, so it chains cleanly with other injected overlays, frame-gen mods and Special K instead of fighting them. There is no hard-coded address to maintain. Input is captured focus-free while the panel is open (raw input re-targeted at a message-only window, pad APIs detoured to hand the game a neutral controller), so the game never loses activation.
 
 ---
 
@@ -43,6 +45,11 @@ toggle_key           = Insert   ; key to open/close the in-game panel
 toggle_gamepad_combo = L3+R3    ; controller combo (buttons joined with +)
 ;   Available buttons: A B X Y  LB RB  L3 R3  Start Back  Up Down Left Right
 allow_stacking       = 0        ; 1 = ignore talisman families (stack anything)
+ui_scale             = 0.00     ; 0 = auto-scale with your resolution; or force 0.50 - 2.00
+
+[panel]
+; The panel's size & position, remembered automatically when you close it.
+; Delete this section to reset the panel to its default placement.
 
 [talismans]
 Erdtree's Favor +2           = 1

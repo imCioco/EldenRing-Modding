@@ -154,7 +154,9 @@ struct IniConfig {
     std::string    open_pad_label = "L3+R3";
     bool show_descriptions = true;
     int  sort_mode = 0;
-    bool focus_input = false;
+    float ui_scale = 0.0f;                  // 0 = auto (from the game's resolution)
+    // Saved overlay panel geometry ([panel]); w/h <= 0 = nothing saved yet.
+    float panel_x = -1.0f, panel_y = -1.0f, panel_w = 0.0f, panel_h = 0.0f;
 };
 
 IniConfig load_config(const Ini& ini) {
@@ -171,7 +173,13 @@ IniConfig load_config(const Ini& ini) {
         XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB);
     c.show_descriptions = ini.get_bool("overlay", "show_descriptions", true);
     c.sort_mode = ini.get_int("overlay", "sort_mode", 0);
-    c.focus_input = ini.get_bool("overlay", "focus_input", false);
+    const float uis = ini.get_float("overlay", "ui_scale", 0.0f);
+    c.ui_scale = uis > 0.0f ? std::clamp(uis, 0.5f, 2.0f) : 0.0f;
+    // Saved panel geometry (written by the overlay on close; see save_config).
+    c.panel_x = ini.get_float("panel", "x", -1.0f);
+    c.panel_y = ini.get_float("panel", "y", -1.0f);
+    c.panel_w = ini.get_float("panel", "width", 0.0f);
+    c.panel_h = ini.get_float("panel", "height", 0.0f);
     for (const auto& kv : ini.section_items("talismans"))
         if (Ini::as_bool(kv.second))
             c.enabled.insert(normalize(kv.first));
@@ -224,7 +232,11 @@ void build_state(const IniConfig& cfg) {
     g_state.open_pad_label = cfg.open_pad_label;
     g_state.show_descriptions = cfg.show_descriptions;
     g_state.sort_mode = cfg.sort_mode;
-    g_state.focus_input = cfg.focus_input;
+    g_state.ui_scale = cfg.ui_scale;
+    g_state.panel_x = cfg.panel_x;
+    g_state.panel_y = cfg.panel_y;
+    g_state.panel_w = cfg.panel_w;
+    g_state.panel_h = cfg.panel_h;
     g_state.talismans.clear();
 
     const auto& baked = baked_by_id();
@@ -331,14 +343,32 @@ void save_config() {
 
     bool show_descriptions;
     int  sort_mode;
+    float ui_scale, px, py, pw, ph;
     std::string open_key_label, open_pad_label;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         show_descriptions = g_state.show_descriptions;
         sort_mode = g_state.sort_mode;
+        ui_scale = g_state.ui_scale;
         open_key_label = g_state.open_key_label;
         open_pad_label = g_state.open_pad_label;
+        px = g_state.panel_x; py = g_state.panel_y;
+        pw = g_state.panel_w; ph = g_state.panel_h;
     }
+    char ui_scale_val[16];
+    std::snprintf(ui_scale_val, sizeof(ui_scale_val), "%.2f", ui_scale);
+
+    // Panel geometry: only persisted once the overlay has actually been open
+    // (w/h stay 0 until then -- don't write a bogus zero-sized panel).
+    const bool have_panel = pw > 0.0f && ph > 0.0f;
+    const char* pkeys[4] = {"x", "y", "width", "height"};
+    char pvals[4][16];
+    std::snprintf(pvals[0], sizeof(pvals[0]), "%.0f", px);
+    std::snprintf(pvals[1], sizeof(pvals[1]), "%.0f", py);
+    std::snprintf(pvals[2], sizeof(pvals[2]), "%.0f", pw);
+    std::snprintf(pvals[3], sizeof(pvals[3]), "%.0f", ph);
+    bool pwrote[4] = {};
+    bool panel_seen = false;
 
     // Managed [overlay] options for self-migration (append any missing from an
     // older .ini so a new DLL version self-heals the file). allow_stacking /
@@ -357,47 +387,100 @@ void save_config() {
          "; 1 = show the effect description pane at the bottom of the overlay"},
         {"sort_mode", std::to_string(sort_mode),
          "; overlay list order: 0 = Talisman ID, 1 = Name (A-Z), 2 = In-game menu order"},
-        {"focus_input", "0",
-         "; 1 = legacy focus-taking input mode (only if the default focus-free capture misbehaves)"},
+        {"ui_scale", ui_scale_val,
+         "; overlay size: 0 = auto (scales with your resolution -- 1440p and up), or force 0.50 - 2.00"},
     };
+
+    // Options this DLL version has RETIRED. Any line assigning one of these --
+    // in any section -- is dropped on the next save, along with the indented
+    // comment block that documents it, so an .ini carried over from an older
+    // version self-heals instead of keeping a key nothing reads any more.
+    const std::unordered_set<std::string> retired_keys = {normalize("focus_input")};
+    bool dropped_retired = false;
+    // Set while skipping the retired key's trailing ";" continuation comments.
+    bool eating_retired_comment = false;
 
     std::vector<std::string> out;
     std::unordered_set<std::string> overlay_present; // normalized [overlay] keys in the file
     int overlay_end = -1;                            // out index just after the last [overlay] key line
+    int panel_end = -1;                              // ...same, for [panel]
     std::string line, section;
+    auto is_blank = [](const std::string& s) {
+        return s.find_first_not_of(" \t\r") == std::string::npos;
+    };
     while (std::getline(in, line)) {
         std::string trimmed = line;
         // find section headers (ignoring leading spaces / trailing comments)
         size_t a = trimmed.find_first_not_of(" \t");
-        if (a != std::string::npos && trimmed[a] == '[') {
+        const bool is_header = a != std::string::npos && trimmed[a] == '[';
+        if (is_header) {
             size_t close = trimmed.find(']', a);
-            if (close != std::string::npos)
-                section = trimmed.substr(a + 1, close - a - 1);
+            if (close != std::string::npos) {
+                section = normalize(trimmed.substr(a + 1, close - a - 1));
+                if (section == "panel") panel_seen = true;
+            }
         }
+
+        // A retired key's documentation block trails the key line (the format
+        // this .ini uses throughout), so keep dropping indented ";" comment
+        // lines until the block ends.
+        if (eating_retired_comment) {
+            const bool comment_line =
+                a != std::string::npos && (trimmed[a] == ';' || trimmed[a] == '#');
+            if (comment_line && !is_header) continue;
+            eating_retired_comment = false;
+            // The removed block usually leaves the blank line that separated it
+            // behind; don't let deletions accumulate blank lines.
+            if (is_blank(line) && !out.empty() && is_blank(out.back())) continue;
+        }
+
         const size_t eq = line.find('=');
-        if (eq != std::string::npos && section == "overlay") {
-            // split key / (value + optional comment)
+        std::string key_norm;
+        if (eq != std::string::npos && !is_header) {
             std::string key = line.substr(0, eq);
             size_t ks = key.find_first_not_of(" \t");
             size_t ke = key.find_last_not_of(" \t");
-            std::string key_trim = (ks == std::string::npos) ? "" : key.substr(ks, ke - ks + 1);
+            key_norm = (ks == std::string::npos) ? "" : normalize(key.substr(ks, ke - ks + 1));
+        }
+        if (!key_norm.empty() && retired_keys.count(key_norm)) {
+            // Drop the assignment wherever it appears, then its comment block.
+            eating_retired_comment = true;
+            dropped_retired = true;
+            // A blank line we already emitted directly above the removed key
+            // would otherwise double up with the one following its comments.
+            if (!out.empty() && is_blank(out.back())) out.pop_back();
+            continue;
+        }
+
+        if (eq != std::string::npos && (section == "overlay" || section == "panel")) {
+            // split key / (value + optional comment)
+            std::string key = line.substr(0, eq);
             std::string rest = line.substr(eq + 1);
             size_t hash = rest.find_first_of(";#");
             std::string comment = (hash == std::string::npos) ? "" : rest.substr(hash);
-            overlay_present.insert(normalize(key_trim));
-            // Only these two are editable from the overlay; everything else
-            // (hotkeys, the per-character seed toggles) is left as authored.
-            if (normalize(key_trim) == "show_descriptions") {
-                line = key + "= " + (show_descriptions ? "1" : "0") +
-                       (comment.empty() ? "" : " " + comment);
-            } else if (normalize(key_trim) == "sort_mode") {
-                line = key + "= " + std::to_string(sort_mode) +
-                       (comment.empty() ? "" : " " + comment);
+            auto rewrite = [&](const std::string& v) {
+                line = key + "= " + v + (comment.empty() ? "" : " " + comment);
+            };
+            if (section == "overlay") {
+                overlay_present.insert(key_norm);
+                // Only these are editable from the overlay; everything else
+                // (hotkeys, the per-character seed toggles) is left as authored.
+                if (key_norm == "show_descriptions") rewrite(show_descriptions ? "1" : "0");
+                else if (key_norm == "sort_mode") rewrite(std::to_string(sort_mode));
+                else if (key_norm == "ui_scale") rewrite(ui_scale_val);
+            } else if (have_panel) { // [panel]: the overlay owns every value
+                for (int i = 0; i < 4; ++i)
+                    if (key_norm == pkeys[i]) { rewrite(pvals[i]); pwrote[i] = true; }
             }
         }
         out.push_back(line);
-        if (section == "overlay" && eq != std::string::npos)
-            overlay_end = static_cast<int>(out.size()); // insert missing options after the last one
+        // Remember where each managed section ends, so anything missing can be
+        // inserted with it rather than at EOF. [panel] tracks EVERY line of the
+        // section, not just assignments: a freshly shipped .ini has the header
+        // and its comments but no keys yet, and they still have to land there.
+        if (eq != std::string::npos && section == "overlay")
+            overlay_end = static_cast<int>(out.size());
+        if (section == "panel") panel_end = static_cast<int>(out.size());
     }
     in.close();
 
@@ -415,8 +498,45 @@ void save_config() {
             overlay_end = static_cast<int>(out.size());
         }
         out.insert(out.begin() + overlay_end, new_opts.begin(), new_opts.end());
+        // That insertion shifted every later line, so a [panel] section below
+        // [overlay] must have its recorded end moved with it -- otherwise the
+        // panel keys below land N lines too early (inside another section's
+        // block).
+        if (panel_end >= overlay_end)
+            panel_end += static_cast<int>(new_opts.size());
         flog("added %zu missing [overlay] option(s) to the .ini", new_opts.size());
     }
+
+    // Panel geometry. Existing keys were rewritten in place above; fill in any
+    // the file is missing, and append the whole section for .ini files from
+    // before the overlay remembered its size/position.
+    if (have_panel) {
+        if (panel_seen) {
+            std::vector<std::string> missing;
+            for (int i = 0; i < 4; ++i)
+                if (!pwrote[i]) missing.push_back(std::string(pkeys[i]) + " = " + pvals[i]);
+            if (!missing.empty() && panel_end >= 0 &&
+                panel_end <= static_cast<int>(out.size())) {
+                // Insert above any blank separator, so the keys sit with their
+                // section rather than glued to the next one.
+                size_t at = static_cast<size_t>(panel_end);
+                while (at > 0 && is_blank(out[at - 1])) --at;
+                out.insert(out.begin() + static_cast<ptrdiff_t>(at),
+                           missing.begin(), missing.end());
+            }
+        } else {
+            out.push_back("");
+            out.push_back("[panel]");
+            out.push_back("; Overlay panel size & position (pixels, relative to the game window),");
+            out.push_back("; saved automatically when the overlay closes. Delete this section to");
+            out.push_back("; reset the panel to its default size and placement.");
+            for (int i = 0; i < 4; ++i)
+                out.push_back(std::string(pkeys[i]) + " = " + pvals[i]);
+        }
+    }
+
+    if (dropped_retired)
+        flog("removed retired option(s) from the .ini (focus_input)");
 
     std::ofstream of(path, std::ios::trunc);
     if (!of) { flog("[WARN] save: cannot open .ini for write"); return; }
@@ -721,6 +841,17 @@ void run_loop() {
 
 // ---- worker thread ----
 DWORD WINAPI run(LPVOID) {
+    // FIRST, before anything slow. The overlay backend composites into the
+    // game's own D3D12 backbuffer, and the only safe way to learn the exact
+    // command queue that presents it is to observe the game's CreateSwapChain*
+    // call. That happens early in startup, so these (lightweight, fail-open)
+    // discovery hooks must be installed before config parsing, the compat wait
+    // below, or the param wait -- missing the transaction leaves the overlay
+    // unavailable for the whole session. It installs hooks only; no COM, no
+    // D3D, no device is created here.
+    if (!overlay::bootstrap())
+        flog("[WARN] graphics interception unavailable; the overlay will not be shown");
+
     Ini ini;
     const bool loaded = ini.load(config_path());
     g_debug    = ini.get_bool("debugging", "debug_console", false);
@@ -739,10 +870,13 @@ DWORD WINAPI run(LPVOID) {
     // erdGameTools: it patches game code and polls half-initialized game
     // singletons during boot -- Windows crash logs show it AV-ing in its own
     // module around the time params load, and any timing perturbation from
-    // another mod can tip it over). When such a mod is present we (a) delay our
-    // own init so our MinHook apply / D3D device creation land after its DX12
-    // hook setup, and (b) later defer the heavy param/FMG work until the game
-    // world is loaded (see the wait below), vacating the boot window entirely.
+    // another mod can tip it over). When such a mod is present we (a) delay the
+    // rest of our init so our input detours land after its DX12 hook setup, and
+    // (b) later defer the heavy param/FMG work until the game world is loaded
+    // (see the wait below), vacating the boot window entirely. The DXGI
+    // discovery hooks above are deliberately NOT delayed: they are pure
+    // observation, chain whatever is already installed, and must see the
+    // swapchain creation that happens during this very window.
     // The mod loader (me3) loads DLLs in directory order, so erdGameTools may
     // load a beat AFTER us -- a single GetModuleHandle check right at startup
     // misses it. Poll for a short window to catch it regardless of load order.
@@ -805,14 +939,20 @@ DWORD WINAPI run(LPVOID) {
             g_state.open_pad_label = cfg.open_pad_label;
             g_state.show_descriptions = cfg.show_descriptions;
             g_state.sort_mode = cfg.sort_mode;
-            g_state.focus_input = cfg.focus_input;
+            g_state.ui_scale = cfg.ui_scale;
+            g_state.panel_x = cfg.panel_x;
+            g_state.panel_y = cfg.panel_y;
+            g_state.panel_w = cfg.panel_w;
+            g_state.panel_h = cfg.panel_h;
         }
 
-        // In-game overlay: separate D3D11/DComp window + focus-free input.
-        // overlay::setup() owns the MinHook lifecycle (MH_Initialize + the
-        // dinput8 GetDeviceState/GetDeviceData detours; the XInput detours are
-        // installed lazily on the first menu-open). No hooks touch the game's
-        // swapchain, so this is safe alongside frame-gen / Special K / erdGameTools.
+        // In-game overlay: focus-free input + the packet-producer thread. The
+        // graphics side was already armed by overlay::bootstrap() at the top of
+        // this worker; setup() adds the input detours (dinput8
+        // GetDeviceState/GetDeviceData now, XInput lazily on the first
+        // menu-open) and spawns the control thread. Nothing here creates a
+        // window, device, or swapchain, and the game's Present/queue stay its
+        // own -- safe alongside frame-gen / Special K / erdGameTools.
         overlay::setup();
         overlay::sync_open_keys(); // pick up the just-published toggle inputs
 
@@ -837,21 +977,32 @@ DWORD WINAPI run(LPVOID) {
         build_state(cfg);
         overlay::sync_open_keys(); // setup() ran before build_state(); pick up the real toggle_key/toggle_gamepad_combo now
 
-        // Self-heal the .ini: if a managed [overlay] option is missing (e.g. a
-        // new option added in this DLL version), write it out now with its
-        // default so upgrading players gain the line without losing settings --
-        // even if they never open the overlay. save_config preserves everything
-        // else. Only when the .ini actually exists (else save_config warns).
+        // Self-heal the .ini: add any managed [overlay] option this DLL version
+        // expects but the file lacks, and evict any option this version has
+        // RETIRED (focus_input), wherever it sits in the file. Runs even if the
+        // player never opens the overlay, so upgrading is a no-op for them;
+        // save_config preserves everything else. Only when the .ini actually
+        // exists (else save_config warns).
         if (loaded) {
             static const char* kOverlayKeys[] = {
                 "toggle_key", "toggle_gamepad_combo", "allow_stacking",
-                "progression_mode", "show_descriptions", "sort_mode", "focus_input",
+                "progression_mode", "show_descriptions", "sort_mode", "ui_scale",
             };
+            static const char* kRetiredKeys[] = {"focus_input"};
             bool needs_migration = false;
             for (const char* k : kOverlayKeys)
                 if (!ini.has("overlay", k)) { needs_migration = true; break; }
+            // A retired key can have been left in ANY section by a hand-edited
+            // or older file -- look for it everywhere, not just [overlay].
+            if (!needs_migration) {
+                for (const std::string& sec : ini.section_names()) {
+                    for (const char* k : kRetiredKeys)
+                        if (ini.has(sec, k)) { needs_migration = true; break; }
+                    if (needs_migration) break;
+                }
+            }
             if (needs_migration) {
-                flog("migrating .ini: adding missing [overlay] option(s)");
+                flog("migrating .ini: adding missing / removing retired [overlay] option(s)");
                 save_config();
             }
         }
@@ -868,6 +1019,15 @@ DWORD WINAPI run(LPVOID) {
 
 } // namespace
 } // namespace cte
+
+// The one export. A DLL with an empty export directory whose DllMain does
+// nothing but CreateThread has the loader-shape of an injected payload rather
+// than a library, and the AV heuristics score that -- see
+// src/CustomTalismanEffects.rc.in. It is also genuinely useful: a loader or a
+// sibling mod can GetProcAddress this to identify the build.
+extern "C" __declspec(dllexport) const char* CustomTalismanEffectsVersion() {
+    return CTE_VERSION;
+}
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {

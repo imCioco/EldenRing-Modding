@@ -1,2 +1,6 @@
 # Ignore archives (used only for updating on Nexus)
 release/*.rar
+
+# Local build bookkeeping: records that release/version.md has already shipped,
+# so build.bat knows to bump instead of reusing the number. Machine-local.
+release/.version_built

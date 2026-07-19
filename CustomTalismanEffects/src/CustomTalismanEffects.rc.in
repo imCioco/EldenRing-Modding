@@ -1,0 +1,53 @@
+// Generated from src/CustomTalismanEffects.rc.in by CMake -- edit the .rc.in,
+// not the generated copy in the build tree.
+//
+// Why this file exists: the shipped DLL was being quarantined by ML/heuristic
+// AV engines (Defender's Wacatac.B!ml and friends). None of them names a real
+// malware family -- they are all classifier verdicts, and the binary carried a
+// tiny .rsrc holding nothing but the linker manifest: no CompanyName, no
+// ProductName, no FileVersion, no description. An unsigned, identity-less DLL
+// that also does inline hooking, AOB scanning and raw-input capture is exactly
+// the "injected implant" shape those classifiers score on. The hooking
+// machinery is non-negotiable for what the mod does, so the strategy is to
+// offset it with identity: this resource is the cheapest measurable
+// improvement, and Authenticode signing is the one that makes it stick.
+//
+// The same fix on QuestPath cleared CrowdStrike and MaxSecure on its own; see
+// QuestPath/.claude/AV_FALSE_POSITIVE.md for the Defender submission steps that
+// only the publisher can do.
+
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    @CTE_VER_MAJOR@,@CTE_VER_MINOR@,@CTE_VER_PATCH@,0
+ PRODUCTVERSION @CTE_VER_MAJOR@,@CTE_VER_MINOR@,@CTE_VER_PATCH@,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_DLL
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0" // U.S. English, Unicode
+        BEGIN
+            VALUE "CompanyName",      "imCioco"
+            VALUE "FileDescription",  "CustomTalismanEffects - Elden Ring talisman effects overlay"
+            VALUE "FileVersion",      "@CTE_VERSION@.0"
+            VALUE "InternalName",     "CustomTalismanEffects.dll"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 imCioco. Released as open source."
+            VALUE "OriginalFilename", "CustomTalismanEffects.dll"
+            VALUE "ProductName",      "CustomTalismanEffects"
+            VALUE "ProductVersion",   "@CTE_VERSION@.0"
+            VALUE "Comments",         "Offline single-player talisman-effect overlay for ELDEN RING. Source: https://github.com/imCioco/EldenRing-Modding/tree/main/CustomTalismanEffects"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
