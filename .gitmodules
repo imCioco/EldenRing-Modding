@@ -22,3 +22,6 @@
 [submodule "OmniCaster/external/Paramdex"]
 	path = OmniCaster/external/Paramdex
 	url = https://github.com/soulsmods/Paramdex
+[submodule "PersistentBuffs/external/Paramdex"]
+	path = PersistentBuffs/external/Paramdex
+	url = https://github.com/soulsmods/Paramdex

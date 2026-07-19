@@ -9,10 +9,15 @@
 //    Magic.requirementFaith            = Faith req    -> divided (min 1)
 //    Magic.requirementLuck             = Arcane req   -> divided (min 1)
 //
+//    EquipParamWeapon.proper*          = catalyst stat requirements
+//                                         (staffs/seals only) -> divided (min 1)
+//
 //  In Elden Ring the `Magic` param contains ONLY sorceries and
 //  incantations, so every row with a cost / requirement is a spell --
-//  there's no extra filtering to do (see README). Run OFFLINE only
-//  (EasyAntiCheat).
+//  there's no extra filtering to do (see README). Catalysts (staffs and
+//  sacred seals) are identified the same way OmniCaster does it: a weapon
+//  row with exactly one of enableMagic/enableMiracle set (see
+//  `is_catalyst`). Run OFFLINE only (EasyAntiCheat).
 // ============================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -104,12 +109,29 @@ short divide_fp(short cost, float divisor, int minCost) {
 // Divide a stat requirement by `divisor`, rounded, floored at 1.
 // A requirement of 0 means "this stat isn't required" (e.g. an incantation
 // needs no INT) and is left at 0 -- we never invent a new requirement.
+// The floor of 1 is hardcoded (no .ini knob), same as the spell requirement
+// divider above.
 unsigned char divide_req(unsigned char req, float divisor) {
     if (req <= 1) return req;                    // 0 stays 0, 1 stays 1
     int v = static_cast<int>(std::lround(req / divisor));
     if (v < 1)   v = 1;                          // spells that need a stat keep >=1
     if (v > 255) v = 255;
     return static_cast<unsigned char>(v);
+}
+
+// A staff or seal has at least one of enableMagic/enableMiracle set: staffs
+// cast sorceries (enableMagic), seals cast incantations (enableMiracle), and
+// natively-dual catalysts (e.g. Staff of the Great Beyond) have both. Normal
+// weapons have neither.
+//
+// Deliberately "or", not "xor": OmniCaster's cast_anything (if that mod is
+// also loaded) flips EVERY catalyst to have BOTH flags set, so an "exactly
+// one" check silently finds zero catalysts whenever OmniCaster's param pass
+// happens to run first (both mods load via their own independent thread --
+// there's no ordering guarantee between them). "At least one" stays correct
+// either way, since only catalysts ever get either flag set to begin with.
+bool is_catalyst(bool enableMagic, bool enableMiracle) {
+    return enableMagic || enableMiracle;
 }
 
 void apply(const Ini& ini) {
@@ -178,6 +200,60 @@ void apply(const Ini& ini) {
         flog("[WARN] no spells found in the Magic param -- possible libER/version mismatch");
 }
 
+// Divide every catalyst's (staff/seal) five stat requirements -- Strength,
+// Agility (Dex), Magic (Int), Faith, Luck (Arcane) -- by the configured
+// divisor. Floored at 1, same rule (and same helper) as the spell
+// requirement divider: a stat the catalyst never needed (0) stays 0.
+void apply_catalyst_requirements(const Ini& ini) {
+    const float divisor = ini.get_float("catalyst_stat_requirements", "divisor", 1.0f);
+    const bool  logEach = ini.get_bool("debugging", "log_each", false);
+
+    if (divisor <= 0.0f) {
+        flog("[WARN] catalyst_stat_requirements divisor must be > 0 (%.2f); nothing changed", divisor);
+        return;
+    }
+    if (std::fabs(divisor - 1.0f) < 0.001f) {
+        flog("catalyst_stat_requirements divisor = 1.0 -> nothing to change");
+        return;
+    }
+
+    int catalysts = 0, changed = 0;
+    for (auto [id, row] : from::param::EquipParamWeapon) {
+        if (!is_catalyst(row.enableMagic, row.enableMiracle)) continue;
+        ++catalysts;
+
+        const unsigned char oldStr = row.properStrength;
+        const unsigned char oldAgi = row.properAgility;
+        const unsigned char oldInt = row.properMagic;
+        const unsigned char oldFth = row.properFaith;
+        const unsigned char oldArc = row.properLuck;
+
+        const unsigned char nStr = divide_req(oldStr, divisor);
+        const unsigned char nAgi = divide_req(oldAgi, divisor);
+        const unsigned char nInt = divide_req(oldInt, divisor);
+        const unsigned char nFth = divide_req(oldFth, divisor);
+        const unsigned char nArc = divide_req(oldArc, divisor);
+
+        bool rc = false;
+        if (nStr != oldStr) { row.properStrength = nStr; rc = true; }
+        if (nAgi != oldAgi) { row.properAgility  = nAgi; rc = true; }
+        if (nInt != oldInt) { row.properMagic    = nInt; rc = true; }
+        if (nFth != oldFth) { row.properFaith    = nFth; rc = true; }
+        if (nArc != oldArc) { row.properLuck     = nArc; rc = true; }
+        if (rc) ++changed;
+
+        if (logEach)
+            flog("catalyst %d  STR %d->%d DEX %d->%d INT %d->%d FTH %d->%d ARC %d->%d",
+                 static_cast<int>(id), oldStr, row.properStrength, oldAgi, row.properAgility,
+                 oldInt, row.properMagic, oldFth, row.properFaith, oldArc, row.properLuck);
+    }
+
+    flog("catalyst_requirements_divisor=%.2f: %d staffs/seals -> requirements changed on %d",
+         divisor, catalysts, changed);
+    if (catalysts == 0)
+        flog("[WARN] no staffs/seals found in EquipParamWeapon -- possible libER/version mismatch");
+}
+
 // ---- worker thread (param load blocks; never do that in DllMain)
 DWORD WINAPI run(LPVOID) {
     Ini ini;
@@ -198,6 +274,7 @@ DWORD WINAPI run(LPVOID) {
         from::CS::SoloParamRepository::wait_for_params(-1);
         flog("params ready -- applying edits");
         apply(ini);
+        apply_catalyst_requirements(ini);
         flog("done.");
     } catch (const std::exception& e) {
         flog("[ERROR] exception: %s", e.what());

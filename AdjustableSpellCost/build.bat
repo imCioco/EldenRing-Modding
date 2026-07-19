@@ -1,8 +1,8 @@
 @echo off
 REM ============================================================
 REM  Build AdjustableSpellCost (Release).
-REM  Configures CMake automatically on first run, then builds.
-REM  Output: build\Release\AdjustableSpellCost.dll
+REM  Configures CMake automatically on first run, then builds and
+REM  copies the DLL (+ default .ini) into release\.
 REM ============================================================
 setlocal
 set "PROJ=%~dp0"
@@ -24,8 +24,13 @@ echo [build] Building Release...
 cmake --build "%PROJ%\build" --config Release
 if errorlevel 1 goto :fail
 
+if not exist "%PROJ%\release\" mkdir "%PROJ%\release"
+copy /Y "%PROJ%\build\Release\AdjustableSpellCost.dll" "%PROJ%\release\" >nul
+if errorlevel 1 goto :fail
+copy /Y "%PROJ%\AdjustableSpellCost.ini" "%PROJ%\release\" >nul
+
 echo.
-echo [build] OK -^> "%PROJ%\build\Release\AdjustableSpellCost.dll"
+echo [build] OK -^> "%PROJ%\release\AdjustableSpellCost.dll"
 goto :end
 
 :fail

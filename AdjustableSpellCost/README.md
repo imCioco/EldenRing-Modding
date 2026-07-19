@@ -1,19 +1,23 @@
 # Adjustable Spell Cost
 
-A native C++ DLL mod for Elden Ring that makes **sorceries and incantations** cheaper to cast and easier to meet the stat requirements for. Two independent knobs, set in the `.ini`:
+A native C++ DLL mod for Elden Ring that makes **sorceries and incantations** cheaper to cast and easier to meet the stat requirements for. Three independent knobs, set in the `.ini`:
 
 - **Divide the FP cost** of every spell by a number you choose, with a minimum-cost floor.
 - **Divide the stat requirements** (Intelligence / Faith / Arcane) of every spell by a number you choose, floored at 1.
+- **Divide the stat requirements needed to wield every staff and sacred seal** (Strength / Dex / Intelligence / Faith / Arcane) by a number you choose, floored at 1.
 
 It rewrites param fields in memory at runtime (via [libER](https://github.com/Dasaav-dsv/libER)) — **no `regulation.bin` edit**:
 
-| Field (`Magic` param) | Meaning | Action |
+| Field | Meaning | Action |
 |---|---|---|
-| `mp` | FP cost (normal cast) | divided by `[fp_cost] divisor`, floored |
-| `mp_charge` | FP cost (charged cast) | divided by `[fp_cost] divisor`, floored |
-| `requirementIntellect` | Intelligence requirement | divided by `[requirements] divisor`, min 1 |
-| `requirementFaith` | Faith requirement | divided by `[requirements] divisor`, min 1 |
-| `requirementLuck` | Arcane requirement (Arcane = "Luck" internally) | divided by `[requirements] divisor`, min 1 |
+| `Magic.mp` | FP cost (normal cast) | divided by `[fp_cost] divisor`, floored |
+| `Magic.mp_charge` | FP cost (charged cast) | divided by `[fp_cost] divisor`, floored |
+| `Magic.requirementIntellect` | Intelligence requirement | divided by `[stat_requirements] divisor`, min 1 |
+| `Magic.requirementFaith` | Faith requirement | divided by `[stat_requirements] divisor`, min 1 |
+| `Magic.requirementLuck` | Arcane requirement (Arcane = "Luck" internally) | divided by `[stat_requirements] divisor`, min 1 |
+| `EquipParamWeapon.properStrength/Agility/Magic/Faith/Luck` | Catalyst (staff/seal) stat requirements | divided by `[catalyst_stat_requirements] divisor`, min 1 |
+
+Catalysts are identified the same way [OmniCaster](../OmniCaster) does it: a weapon row in `EquipParamWeapon` with `enableMagic` (staff) and/or `enableMiracle` (seal) set. Rows with neither are normal weapons and are left untouched. (Deliberately "at least one", not "exactly one" — if OmniCaster's `cast_anything` is also loaded, it flips both flags on every catalyst, and there's no load-order guarantee between the two mods' independent worker threads.)
 
 > ⚠️ **Offline only.** Elden Ring runs EasyAntiCheat. Run with a mod loader that disables it (ModEngine3/me3, ModEngine2, or Elden Mod Loader). Single-player / Seamless Co-op only.
 
@@ -44,11 +48,14 @@ Edit `AdjustableSpellCost.ini` (next to the DLL, same base name):
 divisor  = 2     ; FP cost ÷ 2 (half). 1 = no change, decimals allowed.
 min_cost = 5     ; floor; a spell already cheaper than this keeps its vanilla cost.
 
-[requirements]
+[stat_requirements]
 divisor  = 2     ; INT/Faith/Arcane requirements ÷ 2. 1 = no change. Min is always 1.
+
+[catalyst_stat_requirements]
+divisor  = 2     ; staff/seal STR/DEX/INT/Faith/Arcane requirements ÷ 2. 1 = no change. Min is always 1.
 ```
 
-Set either `divisor` to `1` to leave that aspect untouched (e.g. lower FP cost only, keep vanilla requirements). `[advanced] log_each = 1` writes every spell's before/after values to the log — handy for verifying against the in-game spell menu.
+Set any `divisor` to `1` to leave that aspect untouched (e.g. lower FP cost only, keep vanilla requirements). `[debugging] log_each = 1` writes every spell's and catalyst's before/after values to the log — handy for verifying against the in-game menus.
 
 ---
 
@@ -78,6 +85,7 @@ Every launch writes `logs/AdjustableSpellCost.log` next to the DLL. A success ru
 
 ```
 fp_divisor=2.00 (min 5) req_divisor=2.00: 318 spells -> FP changed on 300, requirements changed on 312
+catalyst_requirements_divisor=2.00: 61 staffs/seals -> requirements changed on 61
 ```
 
 `0 spells` would mean the `Magic` param didn't resolve — usually a libER/game-version mismatch (see the note in the other mods' READMEs). Flip `log_each = 1` to inspect individual spells.
