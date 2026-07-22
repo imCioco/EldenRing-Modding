@@ -32,15 +32,21 @@ With infinite duration, buffs **persist through resting at a grace and fast trav
 **Prerequisites:** Visual Studio 2022 (Desktop C++ workload), CMake ≥ 3.15, Git.
 
 ```sh
-# 1. Get the code + libER
+# 1. Get the code + submodules (libER for param access, Paramdex for the
+#    human-readable names printed in the log). Paramdex is large -- --depth 1.
 git init
 git submodule add https://github.com/Dasaav-dsv/libER external/libER
+git submodule add --depth 1 https://github.com/soulsmods/Paramdex external/Paramdex
 git submodule update --init --recursive
 
 # 2. Configure + build (Release)
 cmake -B build -A x64
 cmake --build build --config Release
 ```
+
+The Paramdex `ER/Names/*.txt` lists are embedded into the DLL at build time, so
+the log can print `1851:[Weapon] Oath of Vengeance - Damage Buff` instead of a
+bare id — no loose data files needed at runtime.
 
 Output: `build/Release/InfiniteWeaponBuffs.dll`
 
@@ -74,12 +80,18 @@ duration = 300           ; seconds, or "infinite" (= permanent)
 duration = infinite
 [consumables]
 duration = infinite
+extra_speffect_ids =     ; optional: raw SpEffect ids to extend directly
 [ashes_of_war]
 duration = infinite
 speffect_ids =           ; optional: Ash-of-War buff SpEffect ids (see dump)
+
+[logging]
+log_affected = 1         ; log every SpEffect the mod extends, by name
 ```
 
-`extra_goods` / `speffect_ids` are precise id allowlists (not category numbers), **unioned with** the built-in defaults — leave them empty unless you need to add something the heuristics miss.
+`extra_goods` / `speffect_ids` / `extra_speffect_ids` are precise id allowlists (not category numbers), **unioned with** the built-in defaults — leave them empty unless you need to add something the heuristics miss.
+
+> **`extra_goods` vs `extra_speffect_ids` — they take different ids.** `[general] extra_goods` wants **item (EquipParamGoods) ids**; `[consumables] extra_speffect_ids` wants **SpEffect ids**. Putting a SpEffect id in `extra_goods` does nothing (it's matched against item ids). If you know a buff's SpEffect id and it isn't picked up automatically, put it in `extra_speffect_ids`. (Starlight Shards — item id `1290`, sort group 10 so outside the normal consumable scan — is in the built-in `extra_goods`; its SpEffect `501290` restores FP over 60 s, so it's extended like any regen buff.)
 
 ### How categories are derived
 
@@ -147,6 +159,16 @@ Every launch writes **`logs/InfiniteWeaponBuffs.log`** (a `logs/` subfolder next
 - **No `.log` file at all** → the DLL never loaded. Check the loader actually lists it, and that it's not failing with a missing dependency (error 126).
 - Log stops after `waiting for params...` → `wait_for_params` never returned. Usually a **libER symbol/version mismatch** (see below).
 - `isEnhance set on N weapon rows` and `patched N ... SpEffectParam rows` → it worked; check in-game.
+
+### Seeing exactly what got affected (`[logging] log_affected`)
+With `log_affected = 1` (default), the log lists **every buff the mod extends** by its Paramdex name, its new duration, and which grease / spell / ash / item reached it — e.g.:
+
+```
+    + 1851:[Weapon] Oath of Vengeance - Poise    -> infinite  (via ash-of-war allowlist)
+    + 2170:Fire Grease                           -> 600s      (via grease 2170:Fire Grease)
+```
+
+followed by a **NOT affected** block for buff-like effects it deliberately left alone (self-harmful debuffs), and the reminder that anything not listed isn't touched. So to check whether the mod affects a given spell/ash/item in-game, just grep the log for its name or id. (For an exhaustive dump of how every category resolves, use `[discover] dump = 1`.)
 
 ### ⚠️ libER symbol/version caveat
 libER resolves game functions from symbol tables baked in at compile time; libER's repo was last updated **2025-04-24**. If your game build (e.g. **1.16.2.0**) is newer than libER's symbols, the param calls can resolve to the wrong addresses — expect a hang at `waiting for params...`, a crash, or `0 rows` patched. If that happens, you need libER symbols updated for your game version (or pin the game to a version libER supports).

@@ -45,7 +45,7 @@ Config load_config() {
     const std::wstring cfgPath = config_path();
     const bool loaded = cfg.ini.load(cfgPath);
 
-    g_debug = cfg.ini.get_bool("discover", "debug_console", false);
+    g_debug = cfg.ini.get_bool("logging", "debug_console", false);
     if (g_debug) {
         AllocConsole();
         FILE* out = nullptr;
@@ -63,6 +63,9 @@ Config load_config() {
     for (int id : kAshOfWarBuffSpEffectsBuiltin)  cfg.ashIds.insert(id);
     parse_int_list(cfg.ini.get_string("general", "extra_goods", ""), cfg.extraGoods);
     parse_int_list(cfg.ini.get_string("ashes_of_war", "speffect_ids", ""), cfg.ashIds);
+    // Raw SpEffect ids to extend directly (NOT goods ids). See Config::extraSpeffects.
+    parse_int_list(cfg.ini.get_string("consumables", "extra_speffect_ids", ""),
+                   cfg.extraSpeffects);
 
     // Dual-wield off-hand mirror: built-in weapon-art pairs + .ini extra_pairs.
     // (Greases are paired dynamically at apply time, so none are listed here.)

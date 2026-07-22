@@ -47,6 +47,7 @@
 
 #include "config.hpp"
 #include "utils.hpp"
+#include "names.hpp"
 #include "apply.hpp"
 #include "discover.hpp"
 
@@ -55,16 +56,20 @@ namespace iwb {
 // ---- worker thread (param load blocks; never do that in DllMain)
 DWORD WINAPI run(LPVOID) {
     Config cfg = load_config();
+    // Readable logs: parse the embedded Paramdex names (+ optional loose
+    // overrides next to the DLL) before we start logging affected effects.
+    load_names();
 
     try {
         flog("waiting for params...");
         from::CS::SoloParamRepository::wait_for_params(-1);
         flog("params ready -- applying edits");
-        if (cfg.ini.get_bool("discover", "dump", false)) {
+        if (cfg.ini.get_bool("logging", "dump", false)) {
             flog("DISCOVER MODE ON -- dumping candidates (durations not applied)");
             dump_candidates(cfg.extraGoods, cfg.horseGoods, cfg.ashIds, cfg.artPairs);
         }
-        apply(cfg.ini, cfg.extraGoods, cfg.horseGoods, cfg.ashIds, cfg.artPairs);
+        apply(cfg.ini, cfg.extraGoods, cfg.horseGoods, cfg.ashIds,
+              cfg.extraSpeffects, cfg.artPairs);
         flog("done.");
     } catch (const std::exception& e) {
         flog("[ERROR] exception: %s", e.what());

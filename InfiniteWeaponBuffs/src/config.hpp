@@ -20,8 +20,13 @@ extern bool      g_debug;
 //   130     = Spectral Steed Whistle (Torrent) -- always protected.
 //   2003170 = DLC "Golden Vow" thrown pot -- buffs the thrower via a
 //             bullet, so it isn't a plain sort-group-20 consumable.
+//   1290    = Starlight Shards -- sorts in group 10 (stat/FP items), so the
+//             sort-group-20 consumable scan misses it; allowlisted here so its
+//             buff (e.g. an overhaul FP-regen effect, default ~60s) is extended.
+//             Vanilla Starlight Shards restore FP instantly (no timer) -> the
+//             "no timer" check safely leaves them unchanged (logged as such).
 inline const int kHorseSummonGoodsBuiltin[]      = { 130 };
-inline const int kExtraConsumableGoodsBuiltin[]  = { 2003170 };
+inline const int kExtraConsumableGoodsBuiltin[]  = { 2003170, 1290 };
 
 // Built-in SpEffect ids for Ash-of-War buffs. Ashes apply their buff through a
 // weapon-skill behavior that can't be reached cleanly from the gem param
@@ -101,6 +106,15 @@ inline const HandPair kDualWieldArtPairsBuiltin[] = {
 constexpr int kSortGroupGrease     = 70; // greases (vanilla + DLC)
 constexpr int kSortGroupConsumable = 20; // buff/heal foods, livers, boluses...
 
+// EquipParamGoods.goodsType == 7 = SPIRIT SUMMON ashes (Crystalian Ashes, ...).
+// They sort in group 20 alongside real consumables, so the consumable scan
+// picks them up -- but their refId resolves to a "[Spirit Summon] X Ashes"
+// SpEffect, i.e. transient SUMMON STATE, not a player buff. Extending those to
+// 600s is wrong (it messes with the summon, and was the "why are spirit ashes
+// affected?" report). Verified in the vanilla regulation: all 561 goodsType-7
+// rows are spirit summons, none are buff consumables -> safe to exclude wholesale.
+constexpr int kGoodsTypeSpiritSummon = 7;
+
 // Guard against pathological / cyclic SpEffect chains.
 constexpr int kChainMaxDepth = 8;
 
@@ -114,6 +128,10 @@ void parse_pair_list(const std::string& spec, std::vector<HandPair>& out);
 struct Config {
     Ini ini;
     std::unordered_set<int> extraGoods, horseGoods, ashIds;
+    // Raw SpEffect ids to extend directly (from [consumables] extra_speffect_ids),
+    // for buffs whose id you know but automatic discovery doesn't reach. Distinct
+    // from extraGoods (which are EquipParamGoods ITEM ids).
+    std::unordered_set<int> extraSpeffects;
     std::vector<HandPair> artPairs;
 };
 

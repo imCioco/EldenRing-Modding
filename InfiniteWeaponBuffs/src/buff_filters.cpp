@@ -68,10 +68,19 @@ bool is_beneficial_buff(const from::paramdef::SP_EFFECT_PARAM_ST* r) {
 
 bool is_debuff(const from::paramdef::SP_EFFECT_PARAM_ST* r) {
     if (!r) return false;
-    // HP / FP / stamina drain or damage-over-time (negative change per tick).
-    if (r->changeHpRate < 0.f      || r->changeHpPoint < 0)      return true;
-    if (r->changeMpRate < 0.f      || r->changeMpPoint < 0)      return true;
-    if (r->changeStaminaRate < 0.f || r->changeStaminaPoint < 0) return true;
+    // HP / FP / stamina DRAIN or damage-over-time.
+    // ⚠ SIGN CONVENTION (verified against the vanilla regulation.bin): for these
+    // periodic change* fields a NEGATIVE value RESTORES the resource (heal /
+    // regen) and a POSITIVE value REMOVES it (damage / drain). So the DEBUFF is
+    // the POSITIVE case, not the negative one. Ground truth: Blessing of the
+    // Erdtree (changeHpPoint -12), Bestial Vitality (-5), Blessing's Boon (-8),
+    // Starlight Shards (changeMpPoint -2), Crimsonburst Crystal Tear (-7),
+    // Scorpion Stew HP Gain (-8) all RESTORE and must NOT be debuffs; Destined
+    // Death's DoT damages via changeHpPoint +1 / changeHpRate +0.1. The prior
+    // "< 0 == debuff" test was inverted and wrongly dropped every regen buff.
+    if (r->changeHpRate > 0.f      || r->changeHpPoint > 0)      return true;
+    if (r->changeMpRate > 0.f      || r->changeMpPoint > 0)      return true;
+    if (r->changeStaminaRate > 0.f || r->changeStaminaPoint > 0) return true;
     // Reduced maximum HP / FP / stamina.
     if (r->maxHpRate < 1.f || r->maxMpRate < 1.f || r->maxStaminaRate < 1.f)
         return true;

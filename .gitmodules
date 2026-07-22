@@ -25,3 +25,6 @@
 [submodule "PersistentBuffs/external/Paramdex"]
 	path = PersistentBuffs/external/Paramdex
 	url = https://github.com/soulsmods/Paramdex
+[submodule "InfiniteWeaponBuffs/external/Paramdex"]
+	path = InfiniteWeaponBuffs/external/Paramdex
+	url = https://github.com/soulsmods/Paramdex

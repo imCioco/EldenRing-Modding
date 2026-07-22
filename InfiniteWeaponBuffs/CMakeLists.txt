@@ -13,10 +13,37 @@ add_definitions(-D_ITERATOR_DEBUG_LEVEL=0)
 #   git submodule update --init --recursive
 add_subdirectory("external/libER" "libER")
 
+# --- embed Paramdex names into the DLL (readable logs) -----------------------
+# external/Paramdex is a git submodule (soulsmods/Paramdex, --depth 1). The ER
+# name lists are converted to byte arrays at build time so the log can print
+# "1851:[Weapon] Oath of Vengeance - Damage Buff" / item + spell names with NO
+# loose files next to the DLL. Loose <ParamName>.txt files next to the DLL still
+# work as overrides/extensions (overhaul mods whose ids Paramdex doesn't know).
+set(PARAMDEX_ER_NAMES "${CMAKE_CURRENT_SOURCE_DIR}/external/Paramdex/ER/Names")
+set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+function(embed_names txt inc var)
+    add_custom_command(
+        OUTPUT "${GENERATED_DIR}/${inc}"
+        COMMAND ${CMAKE_COMMAND}
+                -DINPUT=${PARAMDEX_ER_NAMES}/${txt}
+                -DOUTPUT=${GENERATED_DIR}/${inc}
+                -DVAR=${var}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_names.cmake
+        DEPENDS "${PARAMDEX_ER_NAMES}/${txt}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_names.cmake"
+        COMMENT "Embedding Paramdex ${txt}"
+    )
+endfunction()
+embed_names(SpEffectParam.txt    speffect_names.inc kSpEffectNamesTxt)
+embed_names(EquipParamGoods.txt  goods_names.inc    kGoodsNamesTxt)
+embed_names(Magic.txt            magic_names.inc    kMagicNamesTxt)
+
 add_library(${PROJECT_NAME} SHARED
     src/ini.hpp
     src/utils.hpp
     src/utils.cpp
+    src/names.hpp
+    src/names.cpp
     src/config.hpp
     src/config.cpp
     src/speffect_lookup.hpp
@@ -32,9 +59,12 @@ add_library(${PROJECT_NAME} SHARED
     src/discover.hpp
     src/discover.cpp
     src/main.cpp
+    "${GENERATED_DIR}/speffect_names.inc"
+    "${GENERATED_DIR}/goods_names.inc"
+    "${GENERATED_DIR}/magic_names.inc"
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE src)
+target_include_directories(${PROJECT_NAME} PRIVATE src "${GENERATED_DIR}")
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
 
 # Link libER STATICALLY -> a single self-contained InfiniteWeaponBuffs.dll

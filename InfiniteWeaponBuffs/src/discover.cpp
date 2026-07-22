@@ -84,6 +84,10 @@ void dump_candidates(const std::unordered_set<int>& extraGoods,
             static_cast<int>(row.sortGroupId) == kSortGroupConsumable ||
             extraGoods.count(static_cast<int>(id));
         if (!inScope) continue;
+        // Spirit summon ashes (goodsType 7) sort in group 20 but aren't buffs.
+        if (static_cast<int>(row.goodsType) == kGoodsTypeSpiritSummon &&
+            !extraGoods.count(static_cast<int>(id)))
+            continue;
         const bool horse =
             row.isSummonHorse || horseGoods.count(static_cast<int>(id));
         std::vector<int> entries;
