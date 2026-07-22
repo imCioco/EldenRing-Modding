@@ -16,15 +16,19 @@ enum class ScalingMode {
 struct Config {
     bool        cast_anything = true;
     ScalingMode mode          = ScalingMode::Equipped;
-    bool        dump          = false;
+    // Spell INT/FAI requirements follow max(INT, FAI): the number stays the
+    // same, only the stat it is checked against changes. Independent of `mode`.
+    bool        requirement_swap = false;
+    bool        dump             = false;
 };
 
 // One-shot param pass after wait_for_params(). Safe to call exactly once.
 void apply_all(const Config& cfg);
 
-// Highest-stat mode poll body (call ~1x/s from the worker thread): reads the
-// player's INT/FAI and flips catalyst stat-correction bits when the higher
-// stat changes. No-ops in other modes.
+// Highest-stat poll body (call ~1x/s from the worker thread): reads the
+// player's INT/FAI and, when the higher stat changes, flips the catalyst
+// stat-correction bits (scaling_mode = highest_stat) and/or the spell
+// requirements (requirement_swap). No-ops when neither feature is on.
 void highest_stat_tick(const Config& cfg);
 
 } // namespace omni

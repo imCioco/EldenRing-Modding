@@ -28,6 +28,8 @@ add_library(${PROJECT_NAME} SHARED
     src/main.cpp
     src/scaling.cpp
     src/scaling.hpp
+    src/requirements.cpp
+    src/requirements.hpp
     src/names.cpp
     src/names.hpp
     src/player_stats.cpp

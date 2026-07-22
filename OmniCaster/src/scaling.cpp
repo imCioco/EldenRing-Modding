@@ -10,6 +10,7 @@
 
 #include "names.hpp"
 #include "player_stats.hpp"
+#include "requirements.hpp"
 #include "utils.hpp"
 
 namespace {
@@ -107,6 +108,10 @@ void flip_all(bool use_int) {
 namespace omni {
 
 void apply_all(const Config& cfg) {
+    // ---- spell requirements (Magic param, independent of scaling_mode) ----
+    // Done first: the scaling passes below bail out early in `off` mode.
+    if (cfg.requirement_swap) snapshot_requirements(cfg.dump);
+
     // ---- pass 1: classify every weapon row, collect shared-table usage ----
     struct Catalyst {
         int id;
@@ -264,7 +269,10 @@ void apply_all(const Config& cfg) {
 }
 
 void highest_stat_tick(const Config& cfg) {
-    if (cfg.mode != ScalingMode::HighestStat || g_flip_rows.empty()) return;
+    const bool flip_catalysts =
+        cfg.mode == ScalingMode::HighestStat && !g_flip_rows.empty();
+    const bool flip_spell_reqs = cfg.requirement_swap && requirement_row_count();
+    if (!flip_catalysts && !flip_spell_reqs) return;
 
     static bool have_choice = false;
     static bool use_int     = true;
@@ -292,7 +300,8 @@ void highest_stat_tick(const Config& cfg) {
     if (choice_changed) {
         use_int = want_int;
         have_choice = true;
-        flip_all(use_int);
+        if (flip_catalysts)  flip_all(use_int);
+        if (flip_spell_reqs) flip_requirements(use_int);
     }
 
     if (choice_changed || current_stats_changed || character_changed) {
@@ -300,7 +309,11 @@ void highest_stat_tick(const Config& cfg) {
              st.eff_int, st.base_int, st.bonus_int,
              st.eff_fai, st.base_fai, st.bonus_fai,
              use_int ? "INT" : "FAI",
-             choice_changed ? " [catalysts updated]" : " [choice unchanged]");
+             choice_changed ? (flip_catalysts && flip_spell_reqs
+                                   ? " [catalysts + spell requirements updated]"
+                               : flip_catalysts ? " [catalysts updated]"
+                                                : " [spell requirements updated]")
+                            : " [choice unchanged]");
     }
 
     previous = st;

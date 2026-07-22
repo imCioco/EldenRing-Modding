@@ -24,12 +24,21 @@ usual mod loaders handle that).
   count. It follows the currently loaded character rather than the
   character-select/menu copy. Tracked live: load another character, level up,
   respec, or swap a stat talisman and the scaling stat flips within ~1 second.
+- **Highest-stat requirements** (`requirement_swap = 1`, off by default): a
+  spell's INT/FAI requirement is checked against whichever of the two is
+  higher for you. The number never changes — Meteorite still asks for 30, a
+  faith character just meets it with 30 FAI instead of 30 INT, so it casts
+  instead of fizzling. Spells needing both stats collapse onto the larger of
+  the two requirements; Arcane requirements are left alone. Tracked live on
+  the same ~1 second poll, and independent of `scaling_mode` (you can enable
+  either one without the other).
 
 ## What is deliberately NOT changed
 
-- **Stat requirements**: a sorcery still needs its INT and an incantation its
-  FAI to cast, and catalysts keep their wield requirements. (Use a spell
-  requirement mod alongside if you want those gone.)
+- **Catalyst wield requirements**: staffs and seals keep their own stat
+  requirements, so a pure-faith build still takes the wield penalty holding a
+  staff. Only *spell* requirements are remapped, and only with
+  `requirement_swap = 1`.
 - **School boost passives** stay type-bound: Gravel Stone Seal still boosts
   only dragon incants, the Academy Glintstone Staff only full-moon
   sorceries, etc.
@@ -83,6 +92,14 @@ The mod reads that character's base stats and the INT/FAI corrections on its
 active game effects, then polls the result once a second. This is necessary
 because `PlayerGameData`'s stored “effective” block does not include every
 live correction (Godrick's Great Rune is one observed example).
+
+`requirement_swap` uses that same poll and a fourth table, `Magic`: each
+spell's original `requirementIntellect`/`requirementFaith` pair is snapshotted
+at startup, and every flip rewrites the row from that snapshot — so the
+requirement is never compounded, only moved. If you also run
+[AdjustableSpellCost](../AdjustableSpellCost), both mods edit `Magic` from
+their own threads with no ordering guarantee; the result is coherent either
+way, but the logged numbers depend on which pass ran last.
 
 ## Overhaul mods (Convergence, Reforged, …)
 

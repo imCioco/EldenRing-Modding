@@ -10,6 +10,8 @@
 //    * or: every catalyst scales both spell types off max(INT, FAI),
 //      tracked live via a 1 s poll of PlayerGameData
 //      (scaling_mode = highest_stat)
+//    * optionally, each spell's INT/FAI requirement is checked against that
+//      same higher stat -- same number, other stat (requirement_swap)
 //
 //  Run OFFLINE only (EasyAntiCheat).
 // ============================================================
@@ -53,16 +55,18 @@ DWORD WINAPI run(LPVOID) {
     }
 
     Config cfg;
-    cfg.cast_anything = ini.get_bool("general", "cast_anything", true);
-    cfg.mode          = parse_mode(ini.get_string("general", "scaling_mode", "equipped"));
-    cfg.dump          = ini.get_bool("debugging", "dump", false);
+    cfg.cast_anything    = ini.get_bool("general", "cast_anything", true);
+    cfg.mode             = parse_mode(ini.get_string("general", "scaling_mode", "equipped"));
+    cfg.requirement_swap = ini.get_bool("general", "requirement_swap", false);
+    cfg.dump             = ini.get_bool("debugging", "dump", false);
 
     flog(loaded ? "config loaded" : "[WARN] .ini not found next to the DLL; using defaults");
-    flog("cast_anything=%d scaling_mode=%s dump=%d",
+    flog("cast_anything=%d scaling_mode=%s requirement_swap=%d dump=%d",
          cfg.cast_anything ? 1 : 0,
          cfg.mode == ScalingMode::Off        ? "off"
          : cfg.mode == ScalingMode::Equipped ? "equipped"
                                              : "highest_stat",
+         cfg.requirement_swap ? 1 : 0,
          cfg.dump ? 1 : 0);
 
     names_init();
@@ -81,10 +85,13 @@ DWORD WINAPI run(LPVOID) {
         return 0;
     }
 
-    if (cfg.mode == ScalingMode::HighestStat) {
+    // The poll is shared: scaling flips and requirement swaps both key off the
+    // player's higher casting stat, so either feature alone needs it running.
+    if (cfg.mode == ScalingMode::HighestStat || cfg.requirement_swap) {
         if (!player_stats_init())
             flog("[WARN] player stats unreadable -- catalysts stay on their "
-                 "post-mirror (equipped-style) scaling");
+                 "post-mirror (equipped-style) scaling and spell requirements "
+                 "stay vanilla");
         for (;;) {
             highest_stat_tick(cfg);
             Sleep(1000);
