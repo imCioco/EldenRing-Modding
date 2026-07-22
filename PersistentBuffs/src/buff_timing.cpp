@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "game_access.hpp"
 #include "offsets.hpp"
+#include "sp_entry.hpp"
 #include "utils.hpp"
 
 #include <MinHook.h>
@@ -33,6 +34,13 @@ std::unordered_set<int>            g_present_prev;    // persistable ids last ti
 std::unordered_map<int, int>       g_expect_reappear; // our re-applies, TTL ticks
 bool g_prev_valid = false;
 std::chrono::steady_clock::time_point g_prev_tick;
+
+// Set once a live entry's duration field matches its row's effectEndurance --
+// i.e. the SpecialEffectEntry layout (offsets.hpp +0x40/+0x48) is right for
+// this game build. While true, the engine's own removal_timer is the clock
+// authority and re-applies write it directly; while false everything degrades
+// to the wall-clock + effectEndurance patch-around this mod shipped with.
+bool g_entry_layout_ok = false;
 
 TimingRec fresh_record(int id) {
     const auto* r = sp_row(id);
@@ -128,7 +136,6 @@ void timing_tick(bool player_valid, const std::vector<int>& persistable_now) {
             const auto ex = g_expect_reappear.find(id);
             if (ex != g_expect_reappear.end() && it != g_timing.end()) {
                 g_expect_reappear.erase(ex);
-                if (!g_restore_remaining) it->second.elapsed_s = 0.0;
                 it->second.past_expiry_ticks = 0;
             } else {
                 g_timing[id] = fresh_record(id);
@@ -148,10 +155,33 @@ void timing_tick(bool player_valid, const std::vector<int>& persistable_now) {
 
         rec.elapsed_s += dt;
 
-        // Refresh self-heal: the engine still shows the buff well past our
-        // computed expiry => the player refreshed it mid-duration (a recast
-        // resets the engine's timer without the id ever disappearing, which
-        // presence-based tracking can't observe). Trust the engine and
+        // Engine sync: while the buff is LIVE, its entry carries the engine's
+        // own countdown (removal_timer, captured this tick by sp_entry_capture).
+        // When the entry's total matches our row-based total, that countdown is
+        // the truth -- recasts, pauses, engine top-ups all reflected -- so it
+        // overrides the wall-clock. A mismatch (layout drift on a new game
+        // build, or our own mid-duration restore) falls through to the
+        // wall-clock + self-heal below, i.e. the pre-entry behavior.
+        const EntrySnapshot snap = sp_entry_last(id);
+        if (snap.valid && snap.duration > 0.0f && snap.removal_timer >= 0.0f &&
+            std::fabs(snap.duration - rec.total_s) <=
+                0.5f + rec.total_s * 0.01f) {
+            if (!g_entry_layout_ok) {
+                g_entry_layout_ok = true;
+                flog("buff timing: SpEffect entry layout verified -- engine "
+                     "countdown is now the clock authority");
+            }
+            double el = static_cast<double>(rec.total_s) -
+                        static_cast<double>(snap.removal_timer);
+            rec.elapsed_s = el < 0.0 ? 0.0 : el;
+            rec.past_expiry_ticks = 0;
+            continue;
+        }
+
+        // Refresh self-heal (fallback path): the engine still shows the buff
+        // well past our computed expiry => the player refreshed it mid-duration
+        // (a recast resets the engine's timer without the id ever disappearing,
+        // which presence-based tracking can't observe). Trust the engine and
         // restart our clock. Fails safe: worst case we over-estimate
         // remaining; we never wrongly veto a live buff.
         if (rec.total_s - rec.elapsed_s <= kExpiryMarginS) {
@@ -216,16 +246,18 @@ bool apply_persisted(uintptr_t player, int id) {
     // applies chained effects synchronously, those recurse through the hooked
     // entry into the detour, which takes the mutex -- holding it here would
     // self-deadlock.
+    // Restoring the REMAINING time (not a fresh full duration) is core
+    // behavior -- no longer an .ini option.
     auto* r = sp_row(id);
-    if (g_restore_remaining && r && r->effectEndurance > 0.0f && std::isfinite(rem)) {
-        // Patch-around: the engine copies effectEndurance into the live
-        // effect at application (same reason InfiniteWeaponBuffs' startup
-        // patches govern durations), so briefly writing the remaining time
-        // restores the buff mid-countdown. Aligned 4-byte float write --
-        // atomic on x64, no tearing; the race window (another application of
-        // this same row id between patch and restore) is microseconds in an
-        // offline single-player game -- same accepted-risk class as the
-        // off-thread apply call itself (see CLAUDE.md).
+    const bool want_remaining =
+        r && r->effectEndurance > 0.0f && std::isfinite(rem);
+    if (want_remaining && !g_entry_layout_ok) {
+        // Patch-around (fallback when the entry layout isn't verified for this
+        // game build): the engine copies effectEndurance into the live effect
+        // at application, so briefly writing the remaining time restores the
+        // buff mid-countdown. Aligned 4-byte float write -- atomic on x64; the
+        // microseconds-wide race vs another application of the same row is the
+        // same accepted-risk class as the off-thread apply call (see CLAUDE.md).
         const float orig = r->effectEndurance;
         r->effectEndurance = static_cast<float>(
             rem > kExpiryMarginS ? rem : kExpiryMarginS);
@@ -234,6 +266,15 @@ bool apply_persisted(uintptr_t player, int id) {
     } else {
         apply_fn(reinterpret_cast<void*>(player), id, 1); // unk=1 == "self"
     }
+    // Fix up the freshly-created entry: write the engine countdown directly
+    // (verified layout only) and restore the cast-time payload -- the
+    // catalyst-scaled magnitude a bare re-apply resets to param defaults (the
+    // "+75 instead of +200" holster report). Both are core behavior now (the
+    // old restore_buff_power option is gone). Runs right after the synchronous
+    // apply, on this thread, outside the mutex.
+    sp_entry_restore(player, id,
+                     (want_remaining && g_entry_layout_ok) ? rem : -1.0,
+                     /*restore_payload=*/true);
     {
         std::lock_guard<std::mutex> lock(g_timing_mutex);
         g_expect_reappear[id] = kExpectReappearTicks;

@@ -14,6 +14,12 @@ extern mem::Module g_mod;
 // Resolve the local player ChrIns via WorldChrMan. Returns 0 if not in-game.
 uintptr_t get_player_ins();
 
+// Current HP of the player ChrIns (modules -> data module -> hp), or -1 if
+// unreadable/implausible. hp == 0 while the ChrIns is valid == the player is
+// DEAD -- the authoritative death signal for the freeze (the buff-drop
+// heuristic stays as fallback when this returns -1).
+int get_player_hp(uintptr_t player);
+
 // Resolve PlayerGameData via GameDataMan. Returns 0 if unavailable.
 uintptr_t get_player_game_data();
 

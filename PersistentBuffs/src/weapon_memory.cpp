@@ -1,5 +1,6 @@
 #include "weapon_memory.hpp"
 #include "config.hpp"
+#include "buff_discovery.hpp"
 #include "buff_filters.hpp"
 #include "buff_timing.hpp"
 #include "game_access.hpp"
@@ -54,7 +55,8 @@ void weapon_memory_clear_owners() {
     g_restored_event.clear();
 }
 
-void weapon_memory_tick(uintptr_t player, const std::vector<int>& current) {
+void weapon_memory_tick(uintptr_t player, const std::vector<int>& current,
+                        bool suppress_forget) {
     if (!g_weapon_memory) return;
     const int right = get_active_right_weapon_id();
     const int left  = get_active_left_weapon_id();
@@ -80,10 +82,16 @@ void weapon_memory_tick(uintptr_t player, const std::vector<int>& current) {
     else if (g_ticks_since_change < (1 << 20)) ++g_ticks_since_change;
     const bool recent = g_ticks_since_change <= kReapplyWindowTicks;
 
-    // 1) Learn tentative ownership for newly-applied buffs.
+    // 1) Learn tentative ownership for newly-applied buffs. Skip ids WE just
+    //    restored (g_restored_event): ownership is learned from the PLAYER
+    //    applying a buff, and re-tagging our own restore with whatever weapon
+    //    is now in hand made every character-wide restore accumulate a bogus
+    //    binding for that weapon (then confirmed on the next swap -- the
+    //    "same buff bound to every weapon" growth in the state file).
     if (owner_now > 0)
         for (int id : cur)
-            if (!g_prev_buffs.count(id)) g_applied_owner[id] = owner_now;
+            if (!g_prev_buffs.count(id) && !g_restored_event.count(id))
+                g_applied_owner[id] = owner_now;
 
     // 2) Handle buffs that vanished this tick.
     for (int id : g_prev_buffs) {
@@ -95,15 +103,19 @@ void weapon_memory_tick(uintptr_t player, const std::vector<int>& current) {
             auto a = g_applied_owner.find(id);
             if (a != g_applied_owner.end() && a->second > 0) {
                 if (g_buff_owner[id].insert(a->second).second)
-                    flog("weapon-memory: buff %d bound to weapon %d", id, a->second);
+                    flog("weapon-memory: %s bound to %s",
+                         named(id).c_str(), named_weapon(a->second).c_str());
             }
-        } else {
+        } else if (!suppress_forget) {
             // Vanished with no recent loadout change -> natural expiry. Drop the
             // in-hand weapon(s) from this buff's owners (their copy ran out);
-            // forget the buff entirely once no weapon owns it / if always-persist.
+            // forget the buff entirely once no weapon owns it / if character-wide.
+            // suppress_forget (the player is DEAD): the killing-blow strip is
+            // neither an expiry nor a loadout change -- keep the bindings so a
+            // grease parked on a stowed weapon survives the respawn.
             auto it = g_buff_owner.find(id);
             if (it != g_buff_owner.end()) {
-                if (g_always_persist.count(id)) {
+                if (is_character_wide_buff(id)) {
                     g_buff_owner.erase(it);
                 } else {
                     it->second.erase(right);
@@ -116,36 +128,24 @@ void weapon_memory_tick(uintptr_t player, const std::vector<int>& current) {
     }
 
     // 3) Within the post-change window, restore dropped confirmed buffs. A normal
-    //    weapon buff (grease) is restored only while its owner weapon is back in
-    //    hand (owner not in hand => we swapped away on purpose => leave dropped).
-    //    An "always-persist" buff (AoW self-buff) is restored regardless of which
-    //    weapon is in hand, so it survives any swap like a body buff.
+    //    weapon buff (grease / blade spell) is restored only while its owner
+    //    weapon is back in hand (owner not in hand => we swapped away on purpose
+    //    => leave dropped). A CHARACTER-WIDE buff (AoW self-buff -- classified
+    //    param-driven via is_character_wide_buff, seeded by g_always_persist) is
+    //    restored regardless of which weapon is in hand, so it survives any swap
+    //    like a body buff.
     //    De-duped per change event: in a dual-wield state the engine may keep our
     //    re-applied buff under a different id, so it never re-appears in `cur` --
     //    without this guard we'd re-apply (and log) every tick of the window.
-    // if (recent && g_apply) {
-    //     int n = 0;
-    //     for (const auto& kv : g_buff_owner) {
-    //         const int id = kv.first, owner = kv.second;
-    //         const bool in_hand = (owner == right || owner == left);
-    //         const bool always  = g_always_persist.count(id) != 0;
-    //         if ((in_hand || always) && !cur.count(id) && !g_restored_event.count(id)) {
-    //             g_apply(reinterpret_cast<void*>(player), id, 1);
-    //             g_restored_event.insert(id);
-    //             ++n;
-    //         }
-    //     }
-    //     if (n) flog("weapon-memory: restored %d weapon buff(s) after loadout change", n);
-    // }
     if (recent && g_apply) {
         int n = 0;
         std::vector<int> expired;
         for (const auto& kv : g_buff_owner) {
             const int id = kv.first;
-            const auto& weapons = kv.second;          // now a set of weapon IDs
+            const auto& weapons = kv.second;          // set of owning weapon IDs
             bool in_hand = (weapons.find(right) != weapons.end()) ||
                         (weapons.find(left)  != weapons.end());
-            bool always = g_always_persist.count(id) != 0;
+            bool always = is_character_wide_buff(id);
             if ((in_hand || always) && !cur.count(id) && !g_restored_event.count(id)) {
                 if (!apply_persisted(player, id)) {
                     // Vetoed: its own timer ran out (e.g. it expired within the

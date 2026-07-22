@@ -36,10 +36,12 @@ bool timing_is_expired(int id);
 void timing_prune_expired(std::vector<int>& remembered);
 
 // The one way to re-apply a persisted buff: vetoes expired ids (returns
-// false), otherwise applies via g_apply -- with the buff's REMAINING time
-// when [persistence] restore_remaining_time is on (patches the SpEffectParam
-// row around the call) -- and registers the id so its reappearance keeps its
-// clock. Returns true if applied.
+// false), otherwise applies via g_apply with the buff's REMAINING time --
+// written straight into the engine countdown when the entry layout is
+// verified, else via the SpEffectParam patch-around -- and restores the
+// cast-time payload (buff power), then registers the id so its reappearance
+// keeps its clock. Remaining-time + power restore are core behavior (the old
+// .ini toggles are gone). Returns true if applied.
 bool apply_persisted(uintptr_t player, int id);
 
 // MinHook ApplySpEffect so a recast of a STILL-ACTIVE buff resets its clock

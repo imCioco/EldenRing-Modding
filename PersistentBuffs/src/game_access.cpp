@@ -11,6 +11,20 @@ uintptr_t get_player_ins() {
     return mem::deref(wcm + kPlayerInsOffset);
 }
 
+int get_player_hp(uintptr_t player) {
+    if (!player) return -1;
+    const uintptr_t modules = mem::deref(player + kModulesOffset);
+    if (!modules) return -1;
+    const uintptr_t data = mem::deref(modules + kDataModuleOffset);
+    if (!data) return -1;
+    int hp = -1;
+    if (!mem::safe_read(data + kHpOffset, hp)) return -1;
+    // Trust only values that look like HP; a layout drift reads garbage and
+    // must degrade to "unknown", never to a false death.
+    if (hp < 0 || hp > 100000) return -1;
+    return hp;
+}
+
 uintptr_t get_player_game_data() {
     if (!g_gamedataman_var) return 0;
     const uintptr_t gdm = mem::deref(g_gamedataman_var);

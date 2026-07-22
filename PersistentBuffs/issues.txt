@@ -1,19 +1,251 @@
-FIX IMPLEMENTED -- pending in-game verification (see CLAUDE.md + steps below):
+CHANGES IMPLEMENTED (2026-07-22, buff-tracking/visibility) -- pending in-game verification:
 
-1. weapon memory does not persist with the persistentbuffs.state.ini. If I change my weapon, the buffs applied to that weapon are erased from the memory.
-   -> weapon-memory bindings are now saved per character as `weapon_buffs = id:weapon:remaining` triples in PersistentBuffs.state.ini
-      (written whenever remember_per_weapon OR remember_across_sessions is on; restored on launch when remember_across_sessions is on).
+1. [user report] "buffs are not properly tracked in the persistent state file -- I can't
+   see it saving new buffs (Starlight Shards, buffs applied via spells, or ashes of war
+   like the Grafted Blade buffs)."
+   -> ROOT CAUSE (ashes of war): many AoW self-buffs are applied straight from a TAE/HKS
+      animation event with a HARD-CODED SpEffect id, not through a BehaviorParam refId, so
+      the startup BehaviorParam scan (source 4) never reaches them. They were only persisted
+      if present in the g_always_persist seed -- and Oath of Vengeance (1850-1852, the
+      GRAFTED BLADE GREATSWORD skill), Last Rites, Sacred/Shared Order, Assassin's Gambit,
+      Holy Ground, Raptor of the Mists and Seppuku were all missing from the seed. So
+      is_persistable dropped them -> never in `remembered` -> never saved to the state file.
+   -> FIX: expanded g_always_persist (config.hpp) to the full InfiniteWeaponBuffs
+      character-self-buff set. Element weapon-ENCHANT arts (Cragblade, Sacred Blade, mists,
+      ...) are deliberately kept OUT -- seeding an enchant there forces it character-wide and
+      re-applies it onto every weapon (the Order's Blade bug); those stay weapon-bound via
+      runtime discovery/classification. tools/export_buffs.py parses the list from config.hpp,
+      so --diff-always stays in lock-step automatically.
+   -> Starlight Shards + spell buffs: these are already covered by the param-driven discovery
+      (consumables scan ALL goods; spells via Magic->bullet->chain), so if a specific one
+      isn't saved it's a discovery/resolution miss for that id, not a category gap. To make
+      such misses VISIBLE (the "I can't see it saving" half of the report) ->
 
-2. if i reapply a grease while the same grease is already applied, the timer doesn't reset in the memory file.
-   -> the mod now hooks the game's ApplySpEffect function: any (re)application of a persistable buff on the player resets its
-      tracked timer to the full duration, even when the buff never disappeared. Startup log line to confirm:
-      "buff timing: reapplication hook installed on ApplySpEffect".
+2. [new] [general] log_untracked (default 0): when a buff appears that the mod is NOT
+   persisting (so it won't survive death/fast travel and won't be saved to the state file),
+   log it ONCE per session with its Paramdex name + id and the remedy ("add N to
+   force_persist_ids"). Silent for hard-blocked engine-state/system ids (never buffs). This
+   is the diagnostic for finding the id of any buff that isn't persisting -- the old
+   always-on "(not-tracked)" spam was removed in v1.33 for drowning the log; this is the
+   opt-in, deduped replacement. buff_filters.cpp log_filter_changes.
 
-In-game verification:
- V-A (bug 1): remember_per_weapon=1 + remember_across_sessions=1. Grease weapon A, swap to B, quit the game fully,
-      relaunch, load the same character, swap back to A. PASS: grease returns with ~the right remaining time;
-      the state file shows a weapon_buffs line before the restart; log shows "session: restored N weapon binding(s)".
- V-B (bug 2): grease a weapon, wait ~half the duration, reapply the same grease. PASS: log shows
-      "timing: <id> (re)applied by the game -> timer reset to full" and the buff lasts the full duration from the recast.
- V-C (stability): play a few minutes normally (fights, spells, NPC-heavy area) -- no stutter/crash from the hook.
- V-D (regression): rerun CLAUDE.md checklist V1/V5/V6 (expired buffs stay dead; weapon swap-back restore still works).
+============================================================================
+
+NOTE (2026-07-22): the GREAT RUNE persistence feature described in items below
+(the 600..699 signature scan, 602..607 markers, persist_great_runes option) was
+REMOVED -- it never worked as intended in-game. The great-rune verification items
+here (v1.34 item 1, v1.33 items 2/3's great-rune parts) are moot. The full prior
+implementation is preserved in .claude/GREAT_RUNES_REMOVED.md. Physick tears are a
+separate feature and were kept.
+
+============================================================================
+
+CHANGES IMPLEMENTED (v1.34 work, 2026-07-16) -- pending in-game verification:
+
+1. [user report] "persist_great_runes = 1 doesn't work -- Great Rune effect still gets
+   disabled on death." Log looked successful (reapply: restored ... 602 603 604 605 606
+   607, all show back up in effects changed) which made this non-obvious.
+   -> ROOT CAUSE: the v1.33 great_rune_ids list (602..607) was built by watching which
+      ids appeared live and assuming they were "the" Great Rune effect. Decrypted
+      regulation.bin shows all six carry ZERO gameplay fields -- every add*Status /
+      maxHpRate / maxMpRate / maxStaminaRate field is at its default. They're cosmetic
+      markers that ride along with a real rune activation; restoring them does nothing.
+      The actual buff -- SpEffect 600 ("+5 all attributes": addLifeForceStatus/
+      addWillpowerStatus/addEndureStatus/addStrengthStatus/addDexterityStatus/
+      addMagicStatus/addFaithStatus/addLuckStatus = 5, confirmed ACTIVE on the player at
+      the moment of death in the user's own log) -- was never in the tracked list, so it
+      silently dropped out of `remembered` and was never restored. Also found SpEffect
+      610/620 ("+HP/FP/Stamina%": maxHpRate/maxMpRate/maxStaminaRate != 1), the
+      Radahn/Malenia-style variant, with the identical bug.
+   -> Also confirmed: EquipParamGoods rows for EVERY Great Rune item (191..196 Godrick/
+      Radahn/Morgott/Rykard/Mohg/Malenia, 10080 Unborn) have refId_default == -1 -- no
+      goods->SpEffect param chain exists for any of them (same as the Rune Arc item
+      itself, which only applies a 0s HKS trigger, SpEffect 3450). Rune activation is
+      entirely HKS-scripted; there is no static param path from "which rune is equipped"
+      to "which SpEffect gets applied" for ANY of the seven base-game runes.
+   -> FIX: build_tracked_speffects() now scans SpEffect ids 600..699 for the real-effect
+      signature (permanent duration + nonzero add*Status or maxHpRate/mpRate/stamRate !=
+      1) instead of trusting a hand-picked id list. A full field sweep of every row in
+      500..999 found no other candidate in that neighborhood, so this is provably the
+      complete set of real Great Rune effects FOR THE BASE GAME -- but since no rune item
+      resolves to a SpEffect via params, which of the 3 found ids (600/610/620) any
+      SPECIFIC named rune (Morgott's, Rykard's, Mohg's, the Unborn's, Miquella's DLC
+      rune) uses can't be proven statically, only observed live (log_effects = 1). The
+      original 602..607 markers are still tracked (unchanged, harmless) alongside the
+      scan results.
+   NOTE for the user: if any Great Rune you own is ever seen applying an id outside
+   600..699 (watch the `effects changed` + line when you Rune Arc it), add that id to
+   force_persist_ids as a one-line workaround and report it so the scan range can widen.
+
+============================================================================
+
+CHANGES IMPLEMENTED (v1.33 work) -- pending in-game verification (see CLAUDE.md "v1.33
+verification checklist", X1..X5):
+
+1. [user report] "remember per weapon is broken -- the same buff gets applied to all
+   weapons when I switch them" (state file showed Order's Blade 1677000 bound to three
+   different weapons, growing with every swap; deleting .state.ini didn't help).
+   -> ROOT CAUSE: is_character_wide_buff decided weapon-bound vs character-wide from
+      spCategory alone (enchant categories learned from greases). InfiniteWeaponBuffs'
+      stacking_bonuses ZEROES spCategory on every patched buff (same process, same loaded
+      params, either scan order), and overhaul regulations renumber categories -- so blade
+      spells classified character-wide, weapon-memory restored them on every weapon, and
+      step 1 re-tagged our own restore with the new weapon, confirming a bogus binding on
+      the next swap (the state-file growth).
+   -> FIXES (verified offline against the decrypted vanilla regulation.bin):
+      a) is_enchant_effect now reads the weapon-enchant VFX: any vfxId0..7 row with
+         SpEffectVfxParam.enchantStartDmyId_0 >= 0 or soulParamIdForWepEnchant > 0.
+         Nothing patches SpEffectVfxParam, so the signal survives IWB/overhauls. Tagged
+         per discovery chain (kSrcEnchantVfx) so cycled helper nodes classify like their
+         root; live fallback for undiscovered ids. Selects exactly the 11 armament/shield
+         enchant spells + enchant arts (Cragblade &c); greases stay via their source bit;
+         Determination/RKR (weapon glow but wanted character-wide) stay via the
+         g_always_persist seed, which is checked first.
+      b) spCategory belt kept, but categories are now learned only from grease nodes that
+         carry the enchant vfx (drops the generic cat-20 helper-node pollution).
+      c) weapon_memory step 1 no longer learns ownership from ids in g_restored_event --
+         ownership comes from the PLAYER applying a buff, not from our own restores.
+   NOTE for the user: delete PersistentBuffs.state.ini once -- old files carry the
+   accumulated bogus weapon_buffs bindings and they'd keep restoring on all weapons.
+
+2. [user request] New [persistence] persist_great_runes option (default 1): keep the
+   active Great Rune effect (SpEffect 602..607, tagged g_greatrune_effects at discovery)
+   through death without consuming another Rune Arc. 0 = vanilla (rune deactivates on
+   death). Fast travel never deactivates Great Runes, so only death is affected. Same
+   group-gate shape as persist_physick_tears (after force/always, force can rescue an id);
+   filter-log reason "(great-runes-off)".
+
+3. [user request] Quiet filter log: the "filter: NOT persisting N effect(s)" block now
+   lists ONLY drops caused by an explicit user setting (user-blocked / physick-off /
+   great-runes-off). Untracked effects (talismans, armor passives, environment) and
+   system ids are dropped silently -- the old (not-tracked)/(system) lines reprinted a
+   20+ line talisman block on every active-set change. To find a wanted-but-dropped id,
+   use the `effects changed` +/- lines and force_persist_ids.
+
+============================================================================
+
+CHANGES IMPLEMENTED (v1.32 work) -- pending in-game verification (see CLAUDE.md "v1.32
+verification checklist"):
+
+1. [user report] "the lantern gets removed from the player when he dies"
+   -> ROOT CAUSE: the Lantern light is SpEffect 3245/3246 ("[Item] Lantern - Right/Left",
+      goods 2070). The death wipe strips it like any effect, but a light improves no stat,
+      so the consumable scan's is_beneficial_buff gate never tracked it -> the mod never
+      re-applied it and the player respawned in the dark.
+   -> FIX: discovery step 6 tracks the lantern as a TRUSTED utility source (goods 2070
+      refIds walked + the two vanilla ids as fallback; new kSrcUtility bit). Toggling the
+      lantern OFF while alive is a normal removal -> next tick resyncs `remembered`, so
+      the mod never relights a lantern the player turned off.
+
+2. persist_physick_tears = 1/0 (new [persistence] option, default 1): physick tear effects
+   are now tagged at discovery (EquipParamGoods.goodsType == 10 "Wondrous Physick Tear" --
+   the same marker the mixing menu uses, so overhaul tears count too) and gated as a group.
+   Off = tears drop with reason "(physick-off)" in the filter log; force_persist_ids can
+   still rescue an individual id (the gate sits after force/always, before the allowlist).
+
+3. restore_remaining_time + restore_buff_power REMOVED from the .ini -- both are core
+   behavior now (always on). This is how the mod is meant to work; the options only
+   existed as an escape hatch during the v1.31 rework.
+
+4. The .ini heals itself (config.cpp kSchema/heal_config): on every launch, missing
+   options are re-added with their defaults, unknown options are removed (known old ones
+   -- restore_*, exclude_ids, always_persist_ids, reapply_delay_ms -- with a "deprecated"
+   reason in the log), and user values for known options are preserved verbatim. The file
+   is rewritten ONLY when its option set differs from the schema, so hand-edited comments
+   survive normal runs. Verified in a host harness (old-1.31 ini upgrade, fresh-file
+   generation, idempotent re-run).
+
+5. Readable logs, built in: soulsmods/Paramdex added as a submodule (external/Paramdex,
+   --depth 1); cmake/embed_names.cmake bakes ER/Names/SpEffectParam.txt (4667 names) and
+   EquipParamWeapon.txt (3448 names) into the DLL as byte arrays. load_names() parses them
+   at startup; a SpEffectParam.txt next to the DLL now OVERRIDES/extends the embedded set
+   instead of being required. weapon-memory lines print weapon names (named_weapon).
+   Log format reworked for humans: startup banner with version, settings block, blank-line
+   + "----[ DEATH / RESPAWN -- back in game ]----" section dividers per transition,
+   one indented "+/-" line per effect change (with names), reapply blocks list each
+   restored buff with "(4m05s left)" style durations. DLL still imports only KERNEL32.dll
+   (verified with dumpbin -- the /MT Steam Deck fix holds); size 769 KB.
+
+In-game verification for v1.32: CLAUDE.md W1 (lantern death fix + no relight when toggled
+off), W2 (physick option both ways), W3 (auto-heal on a real install), W4 (names with no
+loose txt file). Then the still-pending v1.31 V-A..V-G below.
+
+============================================================================
+
+FIXES IMPLEMENTED (v1.31 work) -- pending in-game verification (see CLAUDE.md checklists):
+
+1. [Nexus EN] "if you holster your weapon and pull it back out, rather than scaling off of the
+   seal (+200 for me) it applies the static 75 damage seen on grease"
+   -> ROOT CAUSE: re-applying the bare SpEffect id can't know the catalyst scaling that was
+      computed at cast time and stored in the live effect INSTANCE, so the fresh instance gets
+      the param's base (grease-level) values.
+   -> FIX: the mod now snapshots each persistable live effect's entry state every tick
+      (engine countdown at entry+0x40, cast-time payload at +0x50..0x78) and copies it back
+      onto the entry right after any of OUR re-applies (weapon-memory restore, death/fast
+      travel re-apply). [persistence] restore_buff_power = 1. Payload writes are gated to
+      float-looking dwords on both sides, so a layout drift on a future game patch can
+      corrupt nothing. Each restored dword is logged ("entry restore: ... payload restored
+      [ +0x54 1->2.67 ]") -- those log lines will pin the exact magnitude field for us.
+
+2. [Nexus CN] "in 1.30, buffs from incantations such as Golden Vow disappear after death
+   (1.21 kept them, but leaked buffs into other characters on profile switch)"
+   -> ROOT CAUSE (three stacked issues):
+      a) 1.30's source allowlist only tracked Magic refIds that resolve DIRECTLY as SpEffects.
+         AOE/ally incantations (Golden Vow = Magic 6600) apply their buff through a BULLET,
+         and many buffs sit behind replace/cycle chains -- their ACTIVE ids (1660000/1660002
+         family) were never tracked, so they were dropped from `remembered`.
+      b) The death freeze needed >= 2 buffs stripped in one tick; a death with a single
+         tracked buff slipped past it (more likely in 1.30, since the allowlist no longer
+         counts talisman noise).
+      c) The 1.21-era character-switch leak was only fixed when session/weapon-memory was on.
+   -> FIXES:
+      a) Discovery now resolves Magic refs per refCategory (SpEffect AND Bullet, with chain
+         walking + spawn-on-hit child bullets) -- Golden Vow & friends are tracked.
+      b) Death is now detected AUTHORITATIVELY via player hp == 0 (ChrIns modules -> data
+         module +0x138). Any death freezes `remembered`, single buff included; the >=2-drop
+         heuristic stays as fallback if the hp read fails. This also finally implements the
+         independent keep_after_death / keep_after_fast_travel toggles.
+      c) Character-switch detection is now ALWAYS on (GameDataMan is resolved regardless of
+         features); switching profiles clears the previous character's buffs even with
+         session persistence off.
+
+3. Ashes of war fully expanded: instead of the hard-coded 32-id list, discovery now scans
+   BehaviorParam_PC/BehaviorParam (refType SpEffect/Bullet, beneficial-gated) -- every AoW
+   self-buff, vanilla + DLC + overhaul-added, is tracked. Weapon-bound vs character-wide is
+   decided param-driven: effects sharing a grease spCategory (weapon enchants) stay
+   weapon-bound; everything else survives any swap. The old 32-id list remains as a seed.
+
+4. Overhaul compatibility: consumable scan now covers ALL EquipParamGoods rows (any
+   sortGroupId) with the self+beneficial field gate, so overhaul items are discovered
+   wherever they sort. Debuff policy: pure debuffs never pass the gate; status-ailment procs
+   stay hard-blocked by id; items with a downside rider persist via their beneficial effect
+   node. New [persistence] never_persist_ids escape hatch to drop anything unwanted.
+   NOTE: physick tears now persist (they pass the field gate) -- users who dislike that can
+   add their ids to never_persist_ids.
+
+5. Steam Deck / Proton: the DLL was built with /MD (dynamic CRT) and needed the MSVC
+   redistributable inside the game's proton prefix -- absent on Deck, so LoadLibrary failed
+   silently and the mod "did nothing". Now built with /MT (CMAKE_MSVC_RUNTIME_LIBRARY
+   MultiThreaded): the release DLL imports ONLY kernel32.dll (verified) and loads on a bare
+   prefix. SAME FIX APPLIES TO THE SIBLING MODS (they all default to /MD).
+
+In-game verification (all with log_effects = 1):
+ V-A (scaling): weapon buffed via seal incantation with high incant scaling; check added
+      damage; stow/swap away and back (weapon-memory restore) -> damage should return to the
+      seal-scaled value, log shows "entry restore: ... payload restored [...]". Repeat over a
+      death. Compare against restore_buff_power = 0.
+ V-B (incant death): cast incant Golden Vow (+ optionally NOTHING else), die. PASS: buff back
+      after respawn with ~correct remaining; log shows "death detected (hp==0) -> holding".
+      Also check 1660000-family ids are in the startup tracked count (much larger now).
+ V-C (toggles): keep_after_death=0, keep_after_fast_travel=1 -> buffs survive fast travel but
+      not death; log says which gate applied.
+ V-D (char switch, session OFF): buff char A, quit to menu, load char B. PASS: B has nothing;
+      log shows "cleared previous character's buffs".
+ V-E (timer authority): watch for one-time "SpEffect entry layout verified" line; recast a
+      grease mid-duration -> remaining resets to full without the ApplySpEffect-hook log
+      needing to fire; pause in menus should no longer drift the clock.
+ V-F (regression): CLAUDE.md V1..V6 + F1..F4 checklists still pass. Startup line now reads
+      "tracked N SpEffect(s) [greases G, spells S, consumables C, skills/AoW K, great runes R]"
+      with N in the thousands (behavior scan). Watch the first minutes for any state effect
+      leaking through (filter log) -- add leaks to is_system_effect / never_persist_ids.
+ V-G (Steam Deck): on a Deck WITHOUT the VC redist installed, the mod loads and logs.

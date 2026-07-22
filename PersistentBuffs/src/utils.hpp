@@ -17,7 +17,14 @@ std::wstring log_path();
 // ER/Names/SpEffectParam.txt (lines "id name"). Absent -> log uses bare ids.
 std::wstring names_path();
 
+// Append one timestamped line to the log. Multi-line messages ('\n' inside)
+// are aligned under the timestamp; an empty msg writes a blank spacer line.
 void log_line(const std::string& msg, bool truncate = false);
 void flog(const char* fmt, ...);
+// Blank line + "----[ title ]------" divider: marks a phase change (startup
+// done, death/fast-travel transition) so a human can scan the log by section.
+void flog_section(const char* fmt, ...);
+// "12.3s" / "4m05s" / "1h02m" / "infinite" -- human-readable durations.
+std::string fmt_secs(double s);
 
 } // namespace pb

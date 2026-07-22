@@ -1,0 +1,22 @@
+; Copy this to export_buffs.ini and fill in the regulation path.
+; CLI flags (--regulation, --soulsformats, --paramdefs, --names) override these.
+[paths]
+; A regulation.bin to analyse. Can be:
+;   - the loose UXM-unpacked vanilla regulation.bin,
+;   - a mod's regulation.bin (Convergence, Reforged, ERR, ...),
+;   - the one a mod loader serves.
+; Example: C:\Steam\steamapps\common\ELDEN RING\Game\regulation.bin
+regulation =
+
+; Andre.SoulsFormats.dll -- defaults to the copy vendored in the sibling
+; ERR-MapForGoblins-DLL repo (../../ERR-MapForGoblins-DLL/tools/lib). Only set
+; this if your checkout differs.
+soulsformats =
+
+; Paramdex ER paramdef XML dir -- defaults to this mod's vendored submodule
+; (../external/Paramdex/ER/Defs). Leave blank unless overriding.
+paramdefs =
+
+; Paramdex ER SpEffectParam names for readable "id:Name" output -- defaults to
+; ../external/Paramdex/ER/Names/SpEffectParam.txt.
+names =

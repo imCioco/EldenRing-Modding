@@ -53,6 +53,19 @@ inline uintptr_t deref(uintptr_t addr) {
     return safe_read(addr, v) ? v : 0;
 }
 
+// Crash-safe POD write (mirror of safe_read). Game memory is writable where we
+// use this (heap SpEffect entries); a fault just reports false.
+template <typename T>
+inline bool safe_write(uintptr_t addr, const T& value) {
+    if (!addr) return false;
+    __try {
+        *reinterpret_cast<T*>(addr) = value;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // ---- AOB scan ----------------------------------------------------------
 // Pattern like "48 8B 0D ?? ?? ?? ?? 48 85 C9". "??" = wildcard byte.
 // Returns the address of the first match, or 0.

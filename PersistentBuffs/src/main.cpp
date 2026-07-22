@@ -46,6 +46,7 @@
 #include "buff_filters.hpp"
 #include "buff_discovery.hpp"
 #include "buff_timing.hpp"
+#include "sp_entry.hpp"
 #include "weapon_memory.hpp"
 #include "session_store.hpp"
 
@@ -70,13 +71,13 @@ void reapply(uintptr_t player, const std::vector<int>& ids) {
             ++vetoed;
             continue;
         }
-        char tail[24];
-        if (std::isfinite(rem)) std::snprintf(tail, sizeof(tail), "(%.1fs) ", rem);
-        else                    std::snprintf(tail, sizeof(tail), "(inf) ");
-        applied += named(id); applied += tail;
+        applied += "\n  + ";
+        applied += named(id);
+        applied += std::isfinite(rem) ? "  (" + fmt_secs(rem) + " left)"
+                                      : std::string("  (no time limit)");
         ++n;
     }
-    flog("reapply: re-applied %d buff(s), vetoed %d expired: [ %s]",
+    flog("reapply: restored %d buff(s), vetoed %d expired:%s",
          n, vetoed, applied.c_str());
 }
 
@@ -113,9 +114,11 @@ DWORD WINAPI run(LPVOID) {
     // never leaves the active list). No-op if g_apply didn't resolve.
     timing_install_hook();
 
-    // Resolve GameDataMan -- needed for weapon-memory (weapon slots) AND for
-    // session persistence (character-name key at PlayerGameData + kCharNameOffset).
-    if (g_weapon_memory || g_session_persist) {
+    // Resolve GameDataMan -- weapon-memory (weapon slots), session persistence
+    // (character-name key), and the ALWAYS-ON character-switch detection (a
+    // profile switch must never inherit the previous character's buffs, no
+    // matter which features are enabled) all hang off it.
+    {
         bool multiple = false;
         const uintptr_t site = mem::aob_scan_unique(g_mod, kGameDataManAob, &multiple);
         if (site && !multiple) {
@@ -128,9 +131,8 @@ DWORD WINAPI run(LPVOID) {
                 flog("[WARN] weapon-memory: disabled (needs GameDataMan)");
                 g_weapon_memory = false;
             }
-            if (g_session_persist)
-                flog("[WARN] session: GameDataMan unavailable -- all characters "
-                     "share the 'default' key");
+            flog("[WARN] character-switch detection unavailable -- all "
+                 "characters share the 'default' key");
         }
     }
 
@@ -155,12 +157,14 @@ DWORD WINAPI run(LPVOID) {
         flog("[WARN] wait_for_params timed out -- buff filter degraded "
              "(allowlist empty; only force/always-persist ids will persist)");
     }
+    flog_section("startup complete -- watching for buffs");
 
     std::vector<int> remembered;   // buffs to re-apply on the next transition
     std::vector<int> current;
     bool had_player   = false;
     bool frozen       = false;     // holding the pre-strip set through a death
     int  frozen_ticks = 0;
+    bool was_death    = false;     // hp==0 seen this life -> next transition is a death
     std::string last_char_key;     // session: current character key ("" = none yet)
     int         save_ticks = 0;    // session: autosave counter
 
@@ -174,7 +178,20 @@ DWORD WINAPI run(LPVOID) {
             std::vector<int> snap;
             for (int id : current)
                 if (is_persistable(id)) snap.push_back(id);
+            // Capture the live entries' engine state (countdown + cast-time
+            // payload) BEFORE the timing tick, which syncs its clocks to it.
+            sp_entry_capture(player, snap);
             timing_tick(true, snap);
+
+            // Authoritative death signal: hp == 0 while the ChrIns is valid.
+            // Classifies the upcoming transition (death vs fast travel, for
+            // the two independent toggles) and drives the freeze below even
+            // when fewer than kDeathDropThreshold buffs get stripped -- the
+            // old heuristic missed deaths with a single active buff, which is
+            // common now that the allowlist no longer tracks talisman noise.
+            const int  hp   = get_player_hp(player);
+            const bool dead = (hp == 0);
+            if (dead) was_death = true;
             // Drop buffs whose own timer ran out (expired AND absent) so a
             // stale death-freeze snapshot can't resurrect them -- this is the
             // "expired 15s grease came back on fast travel" fix.
@@ -184,66 +201,84 @@ DWORD WINAPI run(LPVOID) {
                 // Just (re)entered a playable state -> a load/fast-travel/respawn
                 // just completed and the engine has wiped effects. Settle, then
                 // (optionally) restore this character's cross-session buffs and
-                // re-apply `remembered`.
-                // TODO: split fast-travel vs death to honor the two toggles
-                //       independently (needs death/respawn detection).
-                const bool session_track = g_session_persist || g_weapon_memory;
-                const bool reapply_path = (g_keep_fast_travel || g_keep_death) &&
-                                          !remembered.empty();
-                if (reapply_path || session_track) {
-                    flog("transition detected (settle %d ms)%s", kReapplyDelayMs,
-                         session_track ? " [session]" : "");
+                // re-apply `remembered`. was_death (hp==0 seen last life)
+                // classifies the transition so the two toggles act independently.
+                if (!remembered.empty() || g_gamedataman_var) {
+                    flog_section("%s -- back in game",
+                                 was_death ? "DEATH / RESPAWN" : "FAST TRAVEL / LOAD");
+                    flog("settling %d ms before re-applying...", kReapplyDelayMs);
                     if (kReapplyDelayMs > 0) Sleep(kReapplyDelayMs);
                     // Re-resolve the player after the settle wait -- the pointer
                     // can move while the world finishes loading. Also required for
                     // reading the character key (PlayerGameData must be populated).
                     const uintptr_t p = get_player_ins();
                     if (!p) {
+                        // Transition didn't complete -- keep was_death so the
+                        // retry on the next valid tick still classifies right.
                         flog("reapply: SKIPPED -- player vanished during settle");
                     } else {
-                        if (session_track) {
-                            bool name_ok = false;
-                            const std::string key =
-                                session_current_key(last_char_key, &name_ok);
-                            if (key != last_char_key) {
-                                // Real character change (incl. the first load):
-                                // never inherit the previous character's buffs.
-                                if (g_session_persist) {
-                                    // Restore from disk if we have a saved entry,
-                                    // else session_restore clears remembered +
-                                    // timing + weapon bindings.
-                                    const bool had_entry = session_restore(key, remembered);
-                                    flog("session: character key='%s' (%s) -- %s",
-                                         key.c_str(),
-                                         name_ok ? "name read ok"
-                                                 : "name read failed, key kept/default",
-                                         had_entry ? "restored saved buffs" : "no saved buffs");
-                                } else {
-                                    // Weapon-memory only: the state file is written
-                                    // under this key but nothing is read back
-                                    // (restore needs remember_across_sessions=1).
-                                    // Still never inherit the previous character's
-                                    // weapon bindings.
-                                    weapon_memory_clear_owners();
-                                    flog("session: character key='%s' (%s) -- "
-                                         "weapon-memory save only (no restore)",
-                                         key.c_str(),
-                                         name_ok ? "name read ok"
-                                                 : "name read failed, key kept/default");
-                                }
-                                last_char_key = key;
-                                save_ticks = 0;
+                        // Character-switch detection is ALWAYS on: a profile
+                        // switch must never inherit the previous character's
+                        // buffs, whatever features are enabled (this was the
+                        // 1.21-era leak). Needs GameDataMan; without it the key
+                        // stays 'default' and switches are invisible (logged at
+                        // startup).
+                        bool name_ok = false;
+                        const std::string key =
+                            session_current_key(last_char_key, &name_ok);
+                        if (key != last_char_key) {
+                            if (g_session_persist) {
+                                // Restore from disk if we have a saved entry,
+                                // else session_restore just clears remembered +
+                                // timing + weapon bindings.
+                                const bool had_entry = session_restore(key, remembered);
+                                flog("session: character key='%s' (%s) -- %s",
+                                     key.c_str(),
+                                     name_ok ? "name read ok"
+                                             : "name read failed, key kept/default",
+                                     had_entry ? "restored saved buffs" : "no saved buffs");
+                            } else {
+                                // No cross-session restore: start the new
+                                // character clean.
+                                remembered.clear();
+                                timing_clear();
+                                weapon_memory_clear_owners();
+                                sp_entry_clear(); // entry payloads never cross characters
+                                flog("session: character key='%s' (%s) -- "
+                                     "cleared previous character's buffs "
+                                     "(no cross-session restore)",
+                                     key.c_str(),
+                                     name_ok ? "name read ok"
+                                             : "name read failed, key kept/default");
                             }
-                            // Same key (e.g. quit-to-menu -> same character): the
-                            // in-memory `remembered` wins; don't re-read disk.
+                            // (g_snap is cleared per-branch above: session_restore
+                            // clears then re-seeds payloads; the no-restore branch
+                            // clears outright. A shared clear here would wipe the
+                            // freshly-seeded cross-session payloads.)
+                            last_char_key = key;
+                            save_ticks = 0;
                         }
+                        // Same key (e.g. quit-to-menu -> same character): the
+                        // in-memory `remembered` wins; don't re-read disk.
+
                         // Drop anything that expired while we were away (also
                         // guards a stale death-freeze snapshot -- see CLAUDE.md).
                         timing_prune_expired(remembered);
-                        if ((g_keep_fast_travel || g_keep_death || g_session_persist) &&
-                            !remembered.empty())
+                        const bool keep_gate = was_death ? g_keep_death
+                                                         : g_keep_fast_travel;
+                        if ((keep_gate || g_session_persist) && !remembered.empty())
                             reapply(p, remembered);
+                        else if (!keep_gate && !remembered.empty()) {
+                            flog("reapply: skipped %zu buff(s) -- %s is off",
+                                 remembered.size(),
+                                 was_death ? "keep_after_death"
+                                           : "keep_after_fast_travel");
+                            remembered.clear();
+                        }
+                        was_death = false; // transition completed & classified
                     }
+                } else {
+                    was_death = false; // nothing to do for this transition
                 }
                 had_player = true;
                 // Fresh life: don't treat the weapon as "swapped" across the
@@ -254,8 +289,9 @@ DWORD WINAPI run(LPVOID) {
             } else {
                 // Stable gameplay: handle weapon swaps, then update `remembered`
                 // with this tick's persistable buffs -- unless we're holding the
-                // pre-strip set through a death (see kDeathDropThreshold).
-                weapon_memory_tick(player, current);
+                // pre-strip set through a death. While dead, the killing-blow
+                // strip must not be read as natural expiry by weapon-memory.
+                weapon_memory_tick(player, current, dead || frozen);
 
                 // How many currently-remembered buffs vanished this tick?
                 // Expired ones don't count: a buff whose own timer ran out
@@ -268,6 +304,17 @@ DWORD WINAPI run(LPVOID) {
                     std::unordered_set<int> have(snap.begin(), snap.end());
                     for (int id : remembered)
                         if (!have.count(id) && !timing_is_expired(id)) ++lost;
+                }
+
+                if (!frozen && dead) {
+                    // The hp==0 read fires at/just after the killing blow, while
+                    // `remembered` still holds the last pre-strip set -- freeze
+                    // it there regardless of how many buffs the strip dropped
+                    // this tick (fixes the single-buff death loss the >=2-drop
+                    // heuristic below can't see).
+                    frozen = true; frozen_ticks = 0;
+                    flog("death detected (hp==0) -> holding %zu buff(s) for "
+                         "re-apply", remembered.size());
                 }
 
                 if (frozen) {
@@ -283,8 +330,13 @@ DWORD WINAPI run(LPVOID) {
                     // `snap` -- it can release a false freeze (natural expiry)
                     // early, never extend one. Mid-duration ids stripped by a death
                     // have frozen clocks and are never pruned.)
-                    if (snap.size() >= remembered.size() ||
-                        ++frozen_ticks > kFreezeMaxTicks) {
+                    // While hp==0 the death is CONFIRMED: hold unconditionally
+                    // until the respawn transition (no early release, no
+                    // failsafe timeout). The heuristic exits below only govern
+                    // freezes that aren't backed by the hp signal (hp
+                    // unreadable, or a revival mod brought the player back).
+                    if (!dead && (snap.size() >= remembered.size() ||
+                                  ++frozen_ticks > kFreezeMaxTicks)) {
                         remembered = std::move(snap);
                         frozen = false; frozen_ticks = 0;
                     }
@@ -334,7 +386,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
         pb::g_hinst = hinst;
         DisableThreadLibraryCalls(hinst);
 
-        pb::log_line("==== PersistentBuffs loaded (DllMain attach) ====", /*truncate=*/true);
+        pb::log_line(std::string("====[ PersistentBuffs v") + pb::kModVersion +
+                     " loaded ]" + std::string(33, '='), /*truncate=*/true);
 
         pb::load_config();
 

@@ -38,6 +38,9 @@ void session_startup_load();
 // from weapon_memory_owners()) are saved too, as `weapon_buffs` id:weapon:rem
 // triples -- so a restart can't erase buffs parked on a stowed weapon. Writes
 // happen when EITHER remember_across_sessions or remember_per_weapon is on.
+// Each persisted id also carries its cast-time entry payload (`buff_payloads`
+// id:h0,..,h9) so a scaling weapon buff restores its catalyst-scaled magnitude
+// after a restart, not the param base.
 void session_save(const std::string& key, const std::vector<int>& remembered);
 
 // Restore character `key`'s saved buffs into `remembered` (replacing it) and
@@ -45,8 +48,11 @@ void session_save(const std::string& key, const std::vector<int>& remembered);
 // timing records + weapon-memory bindings + `remembered` first, so a character
 // with no saved entry ends up with an empty set. When [weapon_memory] is on,
 // also re-seeds the weapon bindings (weapon_memory_seed_owner) so swapping to
-// the owning weapon re-applies its parked buffs. Returns true iff a saved
-// entry existed for `key`. Only called when remember_across_sessions is on.
+// the owning weapon re-applies its parked buffs. Also re-seeds each saved id's
+// cast-time payload into g_snap (sp_entry_seed) and clears g_snap first, so the
+// re-apply restores scaled magnitude (not param base) across a restart. Returns
+// true iff a saved entry existed for `key`. Only called when
+// remember_across_sessions is on.
 bool session_restore(const std::string& key, std::vector<int>& remembered);
 
 } // namespace pb

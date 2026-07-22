@@ -4,3 +4,7 @@
 .vs/
 CMakeSettings.json
 logs/
+
+# Local tool config (holds machine-specific paths) + generated dumps
+tools/export_buffs.ini
+tools/*.json

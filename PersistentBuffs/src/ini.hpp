@@ -66,6 +66,24 @@ public:
         return out;
     }
 
+    // Was "key = ..." present in [sec]? (get_string can't tell a missing key
+    // from an empty value.) Used by the config auto-heal to find missing options.
+    bool has(const std::string& sec, const std::string& key) const {
+        const auto si = data_.find(sec);
+        return si != data_.end() && si->second.count(key) != 0;
+    }
+
+    // All keys seen in [sec] (order unspecified). Used by the config auto-heal
+    // to find unknown/deprecated options that should be removed.
+    std::vector<std::string> keys_in(const std::string& sec) const {
+        std::vector<std::string> out;
+        const auto si = data_.find(sec);
+        if (si == data_.end()) return out;
+        out.reserve(si->second.size());
+        for (const auto& kv : si->second) out.push_back(kv.first);
+        return out;
+    }
+
 private:
     static std::string strip_comment(const std::string& s) {
         const size_t p = s.find_first_of(";#");

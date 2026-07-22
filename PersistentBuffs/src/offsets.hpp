@@ -24,6 +24,23 @@ constexpr uintptr_t kSpEffectFirstSlotOffset = 0x8;
 // Within a SpEffect list slot:
 constexpr uintptr_t kSpEffectIdOffset   = 0x8;   // int  effect id
 constexpr uintptr_t kSpEffectNextOffset = 0x30;  // ptr  next slot
+// Entry timer block + instance payload (source: vswarte/fromsoftware-rs
+// cs::SpecialEffectEntry -- its id/next offsets match the TGA values above,
+// which cross-validates the layout):
+//   +0x40 f32 removal_timer (engine countdown), +0x44 f32, +0x48 f32 duration
+//   (total, -1/0 = infinite), +0x4C f32 interval_timer, +0x50..0x78 payload
+//   (cast-time instance state, incl. catalyst-scaled buff magnitude).
+constexpr uintptr_t kSpEffectTimerOffset   = 0x40;
+constexpr uintptr_t kSpEffectPayloadOffset = 0x50;
+
+// ---- player HP (death detection) ----------------------------------------
+// ChrIns + 0x190 -> ChrInsModuleContainer; container + 0x0 -> CSChrDataModule;
+// data module + 0x138 -> current HP (int). Source: vswarte/fromsoftware-rs
+// (ChrIns::modules / CSChrDataModule::hp) -- the same layout that puts the
+// SpEffect manager at ChrIns+0x178, which is confirmed in-game.
+constexpr uintptr_t kModulesOffset    = 0x190;
+constexpr uintptr_t kDataModuleOffset = 0x0;
+constexpr uintptr_t kHpOffset         = 0x138;
 
 // "Apply SpEffect" function: void ApplySpEffect(ChrIns* chr, int id, char unk).
 // Resolved by AOB scan; the scanned instruction sits INSIDE the function, so the

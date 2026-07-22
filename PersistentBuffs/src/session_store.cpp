@@ -8,9 +8,11 @@
 #include "config.hpp"
 #include "game_access.hpp"
 #include "ini.hpp"
+#include "sp_entry.hpp"
 #include "utils.hpp"
 #include "weapon_memory.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -38,6 +40,10 @@ struct SessionEntry {
     std::string weapon_buffs;  // raw "id:weapon:rem ..." -- weapon-memory bindings
                                // ([weapon_memory] remember_per_weapon), same -1
                                // convention. Absent key in old files -> "".
+    std::string payloads;      // compact "id:idx=hex,.. ..." -- only the cast-time
+                               // payload slots carrying a scaled magnitude, so a
+                               // seal/staff-cast weapon buff restores catalyst-
+                               // scaled, not param base. Absent key -> "".
 };
 std::map<std::string, SessionEntry> g_mirror;
 
@@ -92,6 +98,43 @@ std::vector<WeaponBuff> parse_weapon_buffs(const std::string& s) {
     return out;
 }
 
+// One parsed cast-time payload: buff id + its 10 entry dwords (+0x50..0x78),
+// with every non-persisted slot left at the skip sentinel.
+struct BuffPayload { int id; std::array<uint32_t, 10> dwords; };
+
+// Parse the compact "id:idx=hex,idx=hex ... id:..." form: only the payload slots
+// that carry a scaled magnitude are stored (index-tagged); the rest default to
+// the skip sentinel so sp_entry_restore leaves them alone. Malformed fields are
+// skipped; a token with no valid slot is dropped.
+std::vector<BuffPayload> parse_payloads(const std::string& s) {
+    std::vector<BuffPayload> out;
+    std::istringstream ss(s);
+    std::string tok;
+    while (ss >> tok) {
+        const size_t colon = tok.find(':');
+        if (colon == std::string::npos) continue;
+        try {
+            const int id = std::stoi(tok.substr(0, colon));
+            std::array<uint32_t, 10> p;
+            p.fill(kPayloadSkip); // every unlisted slot: skip on restore
+            std::istringstream ps(tok.substr(colon + 1));
+            std::string field;
+            bool any = false;
+            while (std::getline(ps, field, ',')) {
+                const size_t eq = field.find('=');
+                if (eq == std::string::npos) continue;
+                const int idx = std::stoi(field.substr(0, eq));
+                if (idx < 0 || idx > 9) continue;
+                p[idx] = static_cast<uint32_t>(std::stoul(field.substr(eq + 1), nullptr, 16));
+                any = true;
+            }
+            if (!any) continue; // no usable slot -> nothing to restore
+            out.push_back(BuffPayload{ id, p });
+        } catch (...) { /* skip malformed token */ }
+    }
+    return out;
+}
+
 // Rewrite the whole mirror to <state>.tmp, then atomically replace the real file
 // (MoveFileEx WRITE_THROUGH) so a crash mid-write can't corrupt the state.
 void write_state_file() {
@@ -107,13 +150,16 @@ void write_state_file() {
         f << "; buffs = space-separated id:remaining_seconds pairs; -1 = infinite.\n";
         f << "; weapon_buffs = space-separated id:weapon:remaining_seconds triples\n";
         f << ";   (weapon-memory bindings -- which weapon each grease/blade buff is on).\n";
+        f << "; buff_payloads = space-separated id:idx=hex,.. -- only the entry payload\n";
+        f << ";   slots that carry a scaled magnitude, so buffs restore scaled, not base.\n";
         f << "[state]\n";
         f << "version = " << kSessionFormatVersion << "\n\n";
         for (const auto& [section, e] : g_mirror) {
             f << '[' << section << "]\n";
             f << "saved_unix = " << e.saved_unix << "\n";
             f << "buffs = " << e.buffs << "\n";
-            f << "weapon_buffs = " << e.weapon_buffs << "\n\n";
+            f << "weapon_buffs = " << e.weapon_buffs << "\n";
+            f << "buff_payloads = " << e.payloads << "\n\n";
         }
     } // flush + close before the move
     if (!MoveFileExW(tmp_path.c_str(), final_path.c_str(),
@@ -175,6 +221,7 @@ void session_startup_load() {
         catch (...) { e.saved_unix = 0; }
         e.buffs        = ini.get_string(sec, "buffs", "");
         e.weapon_buffs = ini.get_string(sec, "weapon_buffs", "");
+        e.payloads     = ini.get_string(sec, "buff_payloads", "");
         g_mirror[sec] = std::move(e);
         ++n;
     }
@@ -190,6 +237,7 @@ void session_save(const std::string& key, const std::vector<int>& remembered) {
     const std::string section = "char_" + key;
 
     std::string buffs;
+    std::vector<int> payload_ids; // ids we persisted -> save their cast-time payload
     size_t count = 0;
     for (int id : remembered) {
         if (count >= kSessionMaxBuffs) {
@@ -206,6 +254,7 @@ void session_save(const std::string& key, const std::vector<int>& remembered) {
             std::snprintf(pair, sizeof(pair), "%d:-1", id); // infinite (IWB etc.)
         if (!buffs.empty()) buffs += ' ';
         buffs += pair;
+        payload_ids.push_back(id);
         ++count;
     }
 
@@ -231,11 +280,50 @@ void session_save(const std::string& key, const std::vector<int>& remembered) {
                 weapon_buffs += triple;
                 ++wcount;
             }
+            payload_ids.push_back(id); // parked buff's payload is still frozen in g_snap
             if (wcount >= kSessionMaxBuffs) {
                 flog("session: truncated weapon-memory save for '%s' at %zu binding(s)",
                      key.c_str(), kSessionMaxBuffs);
                 break;
             }
+        }
+    }
+
+    // Cast-time payloads for every id we persisted (flat + weapon-parked), so a
+    // scaling weapon buff (seal/staff-cast) restores its catalyst-scaled
+    // magnitude across a restart, not the param base -- the same state the
+    // in-session weapon-swap restore already gives back. Only ids captured live
+    // this session yield a snapshot; the rest are silently skipped.
+    //
+    // Written COMPACTLY: only slots that carry an actual scaled value are stored
+    // (index-tagged "idx=hex"). Skipped are the non-restorable sentinel slots and
+    // the neutral defaults 0.0 / 1.0 (an unscaled multiplier the bare re-apply
+    // already reproduces -- restoring it is a no-op). A buff with no such slot
+    // (a flat, non-scaling buff whose payload is all 1.0) is omitted entirely
+    // rather than writing ten dead dwords.
+    std::string payloads;
+    {
+        std::unordered_set<int> done;
+        for (int id : payload_ids) {
+            if (!done.insert(id).second) continue; // one payload per id
+            uint32_t p[10];
+            if (!sp_entry_payload_snapshot(id, p)) continue;
+            std::string fields;
+            for (int i = 0; i < 10; ++i) {
+                const uint32_t v = p[i];
+                if (v == kPayloadSkip) continue;              // not restorable
+                if (v == 0x00000000u || v == 0x3F800000u) continue; // neutral 0.0 / 1.0
+                char f[20];
+                std::snprintf(f, sizeof(f), "%s%d=%08x",
+                              fields.empty() ? "" : ",", i, v);
+                fields += f;
+            }
+            if (fields.empty()) continue; // no scaled magnitude worth persisting
+            char head[16];
+            std::snprintf(head, sizeof(head), "%d:", id);
+            if (!payloads.empty()) payloads += ' ';
+            payloads += head;
+            payloads += fields;
         }
     }
 
@@ -250,14 +338,18 @@ void session_save(const std::string& key, const std::vector<int>& remembered) {
     e.saved_unix   = static_cast<long long>(std::time(nullptr));
     e.buffs        = std::move(buffs);
     e.weapon_buffs = std::move(weapon_buffs);
+    e.payloads     = std::move(payloads);
     write_state_file();
 }
 
 bool session_restore(const std::string& key, std::vector<int>& remembered) {
     // A character switch (or first load): never inherit the previous character's
-    // clocks, buffs, or weapon bindings, whether or not a saved entry exists.
+    // clocks, buffs, weapon bindings, or cast-time payloads, whether or not a
+    // saved entry exists. (Clearing g_snap here -- rather than in the caller after
+    // restore -- lets the payload seeding below survive.)
     timing_clear();
     weapon_memory_clear_owners();
+    sp_entry_clear();
     remembered.clear();
 
     const auto it = g_mirror.find("char_" + key);
@@ -307,6 +399,23 @@ bool session_restore(const std::string& key, std::vector<int>& remembered) {
             ++nbind;
         }
         flog("session: restored %zu weapon binding(s) for '%s'", nbind, key.c_str());
+    }
+
+    // Cast-time payload restore: re-seed each saved id's entry payload into
+    // g_snap so the upcoming apply_persisted -> sp_entry_restore gives back the
+    // catalyst-scaled magnitude (e.g. a seal-cast weapon buff's full "+200"),
+    // not the param base -- the same fix the in-session weapon swap already had,
+    // now across a game restart. Seeded for BOTH flat and weapon-parked ids
+    // (payloads are keyed by buff id, and weapon step-3 re-apply reads g_snap
+    // too). g_snap was cleared above, so no stale payload leaks in.
+    if (!it->second.payloads.empty()) {
+        size_t np = 0;
+        for (const BuffPayload& bp : parse_payloads(it->second.payloads)) {
+            if (!is_persistable(bp.id)) continue; // filter drifted / edited-in junk
+            sp_entry_seed(bp.id, bp.dwords.data());
+            ++np;
+        }
+        flog("session: restored %zu buff payload(s) for '%s'", np, key.c_str());
     }
     return true;
 }

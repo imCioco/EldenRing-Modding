@@ -16,7 +16,11 @@ namespace pb {
 // state machine. Corresponds to [weapon_memory] remember_per_weapon in the .ini.
 
 void weapon_memory_reset(); // call across transitions
-void weapon_memory_tick(uintptr_t player, const std::vector<int>& current);
+// suppress_forget: pass true while the player is DEAD (hp == 0 / death freeze)
+// -- the killing-blow strip must not be read as natural expiry, or every death
+// would wipe the per-weapon bindings.
+void weapon_memory_tick(uintptr_t player, const std::vector<int>& current,
+                        bool suppress_forget = false);
 
 // ---- cross-session persistence support ---------------------------------
 // Read-only view of confirmed weapon-bound ownership (buff id -> set of weapon
