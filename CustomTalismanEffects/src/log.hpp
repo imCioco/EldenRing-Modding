@@ -1,7 +1,7 @@
 #pragma once
 
-// Shared logging (file next to the DLL, optional debug console). Used by both
-// the worker (main.cpp) and the overlay.
+// Shared logging (logs/<DllName>.log next to the DLL, with a writable temp
+// fallback), plus an optional debug console. Used by the worker and overlay.
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -19,7 +19,8 @@ std::wstring config_path();
 // name + ".state.ini"). Distinct from config_path()'s human-edited `.ini`.
 std::wstring state_path();
 
-// Append a line to logs/<DllName>.log (truncate to start a fresh log).
+// Append a line to logs/<DllName>.log (truncate to start a fresh log). If that
+// location is unavailable, use %TEMP%/<DllName>/logs/<DllName>.log instead.
 void log_line(const std::string& msg, bool truncate = false);
 
 // printf-style wrapper around log_line.

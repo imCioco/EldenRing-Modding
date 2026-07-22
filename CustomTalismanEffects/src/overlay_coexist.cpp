@@ -6,11 +6,6 @@ namespace cte::coexist {
 
 namespace {
 
-// SHARED across every mod embedding this backend -- see overlay_coexist.hpp.
-// The "QPBackend" prefix is the backend's identity, not QuestPath's: it is the
-// string QuestPath already contends for, so it must stay byte-identical here.
-constexpr const wchar_t* kMenuOwnerMutexName = L"Local\\QPBackend.MenuOwner.v1";
-
 HANDLE g_menu_owner = nullptr;
 bool   g_owned = false;
 

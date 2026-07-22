@@ -39,6 +39,7 @@
 #include "messages.hpp"
 #include "offsets.hpp"
 #include "overlay.hpp"
+#include "runtime_compat.hpp"
 #include "session_store.hpp"
 #include "state.hpp"
 #include "talisman_names.hpp"
@@ -841,6 +842,11 @@ void run_loop() {
 
 // ---- worker thread ----
 DWORD WINAPI run(LPVOID) {
+    // First worker-thread diagnostics: if these lines are absent, the DLL did
+    // not reach its worker and the failure belongs to the loader/prefix rather
+    // than logging, input, or swapchain validation.
+    runtime_compat::log_environment();
+
     // FIRST, before anything slow. The overlay backend composites into the
     // game's own D3D12 backbuffer, and the only safe way to learn the exact
     // command queue that presents it is to observe the game's CreateSwapChain*

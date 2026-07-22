@@ -1,17 +1,13 @@
 #include "hooks.hpp"
 
 #include "log.hpp"
+#include "overlay_coexist.hpp"
 
 #include <MinHook.h>
 
 namespace cte::hooks {
 
 namespace {
-
-// Backend-wide, session-local. Every mod embedding this backend contends for
-// this exact name -- see the InstallLock comment in hooks.hpp before changing
-// it (the short answer is: don't).
-constexpr const wchar_t* kInstallMutexName = L"Local\\QPBackend.HookInstall.v1";
 
 // Long enough to outlast a legitimate batch (MH_ApplyQueued suspends and
 // resumes every thread in the process, which on a loaded game can take tens of
@@ -24,7 +20,8 @@ InstallLock::InstallLock() {
     // A named mutex is recursive per owning thread, so nesting an InstallLock
     // inside another on the same thread is safe (each ctor acquires, each dtor
     // releases once).
-    HANDLE h = CreateMutexW(nullptr, FALSE, kInstallMutexName);
+    HANDLE h = CreateMutexW(nullptr, FALSE,
+                            coexist::kHookInstallMutexName);
     if (!h) {
         flog("[hooks] [WARN] hook-install mutex unavailable (err %lu); "
              "installing unserialized -- a second mod installing right now "
@@ -62,12 +59,28 @@ bool init() {
 }
 
 bool create(void* target, void* detour, void** original) {
-    if (MH_CreateHook(target, detour, original) != MH_OK) return false;
-    return MH_QueueEnableHook(target) == MH_OK;
+    const MH_STATUS created = MH_CreateHook(target, detour, original);
+    if (created != MH_OK) {
+        flog("[hooks] [ERROR] MH_CreateHook(%p -> %p) failed: %s (%d)",
+             target, detour, MH_StatusToString(created),
+             static_cast<int>(created));
+        return false;
+    }
+    const MH_STATUS queued = MH_QueueEnableHook(target);
+    if (queued != MH_OK) {
+        flog("[hooks] [ERROR] MH_QueueEnableHook(%p) failed: %s (%d)",
+             target, MH_StatusToString(queued), static_cast<int>(queued));
+        return false;
+    }
+    return true;
 }
 
 bool apply() {
-    return MH_ApplyQueued() == MH_OK;
+    const MH_STATUS status = MH_ApplyQueued();
+    if (status == MH_OK) return true;
+    flog("[hooks] [ERROR] MH_ApplyQueued failed: %s (%d)",
+         MH_StatusToString(status), static_cast<int>(status));
+    return false;
 }
 
 void deinit() {

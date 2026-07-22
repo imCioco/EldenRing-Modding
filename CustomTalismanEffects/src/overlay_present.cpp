@@ -32,6 +32,7 @@
 
 #include "hooks.hpp"
 #include "log.hpp"
+#include "overlay_coexist.hpp"
 #include "overlay_d3d12.hpp"
 #include "overlay_dxgi_shadow.hpp"
 #include "overlay_frame.hpp"
@@ -504,6 +505,13 @@ std::vector<ColorObservation> g_color_observations;
 uint64_t g_primary_generation = 0;
 HWND g_primary_hwnd = nullptr;
 uint64_t g_color_unknown_logged_generation = 0;
+// Diagnostics for the otherwise-silent shadow-to-primary path.  All are
+// written only under g_render_mutex.
+uint64_t g_present_reached_logged_generation = 0;
+uint64_t g_describe_reject_logged_generation = 0;
+const char* g_describe_reject_reason = nullptr;
+const char* g_primary_block_reason = nullptr;
+uint64_t g_queue_missing_logged_generation = 0;
 std::unique_ptr<d3d12::Session> g_session;
 struct PendingCompositedBuffer {
     uint64_t generation = 0;
@@ -610,7 +618,8 @@ void record_nvapi_display_binding(
     g_nvapi_state_revision.fetch_add(1, std::memory_order_release);
 }
 
-void record_nvapi_color_observation(uint32_t display_id, int32_t hdr_mode) {
+void record_nvapi_color_observation(uint32_t display_id, int32_t hdr_mode,
+                                    const char* observed_via) {
     NvapiColorObservation observed;
     observed.display_id = display_id;
     observed.hdr_mode = hdr_mode;
@@ -651,9 +660,9 @@ void record_nvapi_color_observation(uint32_t display_id, int32_t hdr_mode) {
     }
     g_nvapi_state_revision.fetch_add(1, std::memory_order_release);
 
-    flog("[overlay-v2] observed successful NvAPI HDR SET "
+    flog("[overlay-v2] observed NvAPI HDR state via %s "
          "(mode=%s, display_id=%u, output=%s)",
-         nvapi_hdr_mode_name(hdr_mode), display_id,
+         observed_via, nvapi_hdr_mode_name(hdr_mode), display_id,
          observed.output_name[0] ? observed.output_name.data() : "unmapped");
 }
 
@@ -885,46 +894,62 @@ bool supported_backbuffer_format(DXGI_FORMAT format) noexcept {
            format == DXGI_FORMAT_R16G16B16A16_FLOAT;
 }
 
+// Every rejection here is a silent per-Present no-op, which makes a chain that
+// validates on one loader and not another impossible to diagnose from a log.
+// `reason` names the failing check so the caller can report it once.
 bool describe_swapchain(IDXGISwapChain* base,
                         ComPtr<IDXGISwapChain3>& swapchain3,
                         ComPtr<ID3D12Device>& device,
                         uint64_t& generation,
                         void*& device_id,
                         HWND& hwnd,
-                        DXGI_SWAP_CHAIN_DESC1& desc) noexcept {
+                        DXGI_SWAP_CHAIN_DESC1& desc,
+                        const char*& reason) noexcept {
+    reason = "renderer_ineligible";
     if (!base || !dxgi_shadow::renderer_eligible(base) ||
         FAILED(base->QueryInterface(IID_PPV_ARGS(&swapchain3))) || !swapchain3)
         return false;
+    reason = "no_d3d12_device"; // rejects D3D11 and foreign helper swapchains
     if (FAILED(base->GetDevice(IID_PPV_ARGS(&device))) || !device)
-        return false; // rejects D3D11 and foreign helper swapchains
+        return false;
 
+    reason = "getdesc1_failed";
     if (FAILED(swapchain3->GetDesc1(&desc)))
         return false;
+    reason = "hwnd_not_a_valid_game_window"; // composition/CoreWindow/hidden
     if (FAILED(swapchain3->GetHwnd(&hwnd)) || !valid_game_window(hwnd))
-        return false; // composition/CoreWindow/hidden helper chains fail closed
+        return false;
 
+    reason = "buffer_count_or_sample_count";
     if (desc.BufferCount < 2 || desc.BufferCount > 8 || desc.SampleDesc.Count != 1)
         return false;
+    reason = "unsupported_format";
     if (!supported_backbuffer_format(desc.Format)) return false;
+    reason = "not_a_render_target";
     if ((desc.BufferUsage & DXGI_USAGE_RENDER_TARGET_OUTPUT) == 0) return false;
     constexpr UINT kUnsupportedFlags =
         DXGI_SWAP_CHAIN_FLAG_RESTRICTED_CONTENT |
         DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY |
         DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED;
+    reason = "restricted_or_protected_flags";
     if ((desc.Flags & kUnsupportedFlags) != 0) return false;
+    reason = "not_a_flip_model_swapchain";
     if (desc.SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD &&
         desc.SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)
         return false;
 
     generation = dxgi_shadow::generation_token(base);
     device_id = com_identity(device.Get());
+    reason = "no_generation_or_device_identity";
     if (!generation || !device_id) return false;
 
     ComPtr<ID3D12Resource> backbuffer;
+    reason = "getbuffer_failed";
     if (FAILED(swapchain3->GetBuffer(swapchain3->GetCurrentBackBufferIndex(),
                                      IID_PPV_ARGS(&backbuffer))) || !backbuffer)
         return false;
     const D3D12_RESOURCE_DESC resource_desc = backbuffer->GetDesc();
+    reason = "backbuffer_shape_mismatch";
     if (resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         resource_desc.DepthOrArraySize != 1 || resource_desc.MipLevels != 1 ||
         resource_desc.SampleDesc.Count != 1 ||
@@ -934,12 +959,16 @@ bool describe_swapchain(IDXGISwapChain* base,
         return false;
     if (desc.Width == 0) desc.Width = static_cast<UINT>(resource_desc.Width);
     if (desc.Height == 0) desc.Height = resource_desc.Height;
+    reason = "backbuffer_size_mismatch";
     if (resource_desc.Width != desc.Width || resource_desc.Height != desc.Height)
         return false;
     // Tiny video/probe/helper chains are never the Elden Ring presentation
     // surface.  Requiring a plausible game canvas makes initial selection less
     // dependent on whichever injected module happens to Present first.
-    return desc.Width >= 640 && desc.Height >= 360;
+    reason = "canvas_below_640x360";
+    if (desc.Width < 640 || desc.Height < 360) return false;
+    reason = nullptr;
+    return true;
 }
 
 bool eligible_shadow_candidate(IDXGISwapChain* base) noexcept {
@@ -1021,9 +1050,24 @@ bool select_primary(uint64_t generation, HWND hwnd, void* device_identity,
     if (!g_primary_generation) {
         // Sustained foreground presents reject launchers, setup probes, video,
         // and helper swapchains without relying on DLL-name allowlists.
-        if (observed->consecutive_presents < 8 ||
-            GetAncestor(GetForegroundWindow(), GA_ROOT) != hwnd)
+        const HWND foreground = GetAncestor(GetForegroundWindow(), GA_ROOT);
+        if (observed->consecutive_presents < 8 || foreground != hwnd) {
+            // Both gates are otherwise invisible and retried forever, so a
+            // chain that presents fine but never gets selected looks exactly
+            // like one that never presents at all.  Report the blocking
+            // reason once, and again only if it changes.
+            const char* blocker = observed->consecutive_presents < 8
+                                      ? "fewer than 8 sustained presents"
+                                      : "the game window is not foreground";
+            if (g_primary_block_reason != blocker) {
+                g_primary_block_reason = blocker;
+                flog("[overlay-v2] primary selection blocked: %s "
+                     "(presents=%u, swapchain hwnd=%p, foreground root=%p)",
+                     blocker, observed->consecutive_presents, hwnd, foreground);
+            }
             return false;
+        }
+        g_primary_block_reason = nullptr;
         g_primary_generation = generation;
         g_primary_hwnd = hwnd;
         g_retry_on_next_open.store(false, std::memory_order_release);
@@ -1091,6 +1135,15 @@ void before_present_impl(IDXGISwapChain* base,
     const uint64_t call_generation = dxgi_shadow::generation_token(base);
     if (!call_generation) return;
 
+    // The single most valuable line in the backend log: it splits "our vtable
+    // shadow is never invoked" (line absent) from "our validation rejects the
+    // chain" (line present, followed by a reject reason).
+    if (g_present_reached_logged_generation != call_generation) {
+        g_present_reached_logged_generation = call_generation;
+        flog("[overlay-v2] shadowed Present reached the overlay for generation %llu",
+             static_cast<unsigned long long>(call_generation));
+    }
+
     // Lifetime identity must survive a partial alias installation so resize
     // and device-loss cleanup still work. Rendering eligibility is a separate,
     // stricter gate. If eligibility is ever revoked on the selected chain,
@@ -1126,15 +1179,36 @@ void before_present_impl(IDXGISwapChain* base,
     }
     if (g_session_rebuild_pending) return;
 
+    const char* describe_reason = nullptr;
     if (!describe_swapchain(base, swapchain3, device, generation, device_id,
-                            hwnd, desc))
+                            hwnd, desc, describe_reason)) {
+        if (g_describe_reject_logged_generation != call_generation ||
+            g_describe_reject_reason != describe_reason) {
+            g_describe_reject_logged_generation = call_generation;
+            g_describe_reject_reason = describe_reason;
+            flog("[overlay-v2] swapchain validation rejected generation %llu: %s",
+                 static_cast<unsigned long long>(call_generation),
+                 describe_reason ? describe_reason : "unknown");
+        }
         return;
+    }
+    if (g_describe_reject_reason) {
+        g_describe_reject_reason = nullptr;
+        flog("[overlay-v2] swapchain validation now passes for generation %llu",
+             static_cast<unsigned long long>(call_generation));
+    }
 
     // Queue identity is part of swapchain identity for D3D12.  Do not publish
     // a usable canvas (and therefore do not capture input) until the exact
     // queue supplied to CreateSwapChain* or ResizeBuffers1 is known.
     queue = queue_for_swapchain(generation, device_id);
     if (!queue) {
+        if (g_queue_missing_logged_generation != generation) {
+            g_queue_missing_logged_generation = generation;
+            flog("[overlay-v2] no exact queue bound for generation %llu; "
+                 "canvas stays unavailable",
+                 static_cast<unsigned long long>(generation));
+        }
         if (generation == g_primary_generation)
             publish_canvas(hwnd, desc.Width, desc.Height, false, false);
         return;
@@ -1614,6 +1688,56 @@ CreateSwapChainForHwndFn g_next_create_swapchain_for_hwnd = nullptr;
 NvapiGetDisplayIdByNameFn g_next_nvapi_get_display_id_by_name = nullptr;
 NvapiHdrColorControlFn g_next_nvapi_hdr_color_control = nullptr;
 
+// ---- late-adoption state (see the adoption section further down) ----
+//
+// A loader can inject this mod after the game already created its swapchain
+// (Elden Mod Loader delays, manual injectors). The creation detours then never
+// run, and without this fallback the canvas could never validate. Adoption
+// watches live Present calls through pass-through observer hooks and installs
+// the same per-instance shadow on the already-existing swapchain.
+
+using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(
+    IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+using ExecuteCommandListsFn =
+    void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT,
+                             ID3D12CommandList* const*);
+
+PresentFn g_next_present_observed = nullptr;
+Present1Fn g_next_present1_observed = nullptr;
+ExecuteCommandListsFn g_next_execute_command_lists = nullptr;
+
+enum class AdoptionState : uint32_t {
+    Idle = 0,     // never armed; zero overhead on the normal creation path
+    Pending,      // observers active, waiting for a candidate + queue evidence
+    Adopted,      // a live swapchain was shadowed and bound
+    Failed,       // permanently ambiguous or unprovable; stay pass-through
+};
+std::atomic<uint32_t> g_adoption_state{
+    static_cast<uint32_t>(AdoptionState::Idle)};
+bool g_adoption_hooks_installed = false; // overlay/control thread only
+
+// The probe swapchain used to resolve vtable code pointers must never be
+// shadowed, bound, or counted as a game creation.
+thread_local bool g_adoption_probe_in_progress = false;
+
+// Forensics: how often the creation detours actually ran, and where the
+// installed patches point today. Read by log_creation_hook_forensics().
+std::atomic<uint32_t> g_creation_detour_calls{0};
+
+// Set only when a creation detour observed a game swapchain AND shadowed and
+// queue-bound it.  This is the evidence the discovery watchdog needs: without
+// it, a visible game window is mistaken for a late load.
+std::atomic<bool> g_observed_creation{false};
+
+// This mod intercepts DXGI creation via factory vtable slots (see
+// install_factory_slot); the code-patch targets are the fallback.  Forensics
+// inspects whichever was actually used.
+void** g_forensics_create_swapchain_slot = nullptr;
+void** g_forensics_create_swapchain_for_hwnd_slot = nullptr;
+void* g_forensics_create_swapchain_target = nullptr;
+void* g_forensics_create_swapchain_for_hwnd_target = nullptr;
+
 int __cdecl nvapi_get_display_id_by_name_detour(const char* display_name,
                                                  uint32_t* display_id) {
     const int status =
@@ -1646,7 +1770,8 @@ int __cdecl nvapi_hdr_color_control_detour(
         status == 0 && request_valid &&
         command == static_cast<int32_t>(NvapiHdrCommand::Set)) {
         try {
-            record_nvapi_color_observation(display_id, hdr_mode);
+            record_nvapi_color_observation(display_id, hdr_mode,
+                                           "the game's successful SET");
         } catch (...) {
             // Observation is fail-closed and must never alter host behavior.
         }
@@ -1680,15 +1805,19 @@ bool install_swapchain_shadow(IDXGISwapChain* swapchain) noexcept {
 HRESULT STDMETHODCALLTYPE create_swapchain_detour(
     IDXGIFactory* factory, IUnknown* queue, DXGI_SWAP_CHAIN_DESC* desc,
     IDXGISwapChain** result_swapchain) {
+    if (!g_adoption_probe_in_progress)
+        g_creation_detour_calls.fetch_add(1, std::memory_order_relaxed);
     BindingScope binding_scope(g_creation_transaction);
     const HRESULT result =
         g_next_create_swapchain(factory, queue, desc, result_swapchain);
-    if (!g_stopping.load(std::memory_order_acquire) && SUCCEEDED(result) &&
+    if (!g_adoption_probe_in_progress &&
+        !g_stopping.load(std::memory_order_acquire) && SUCCEEDED(result) &&
         result_swapchain && *result_swapchain &&
         eligible_shadow_candidate(*result_swapchain) &&
         install_swapchain_shadow(*result_swapchain) &&
         bind_swapchain_queue(*result_swapchain, queue,
                              binding_scope.id(), binding_scope.depth())) {
+        g_observed_creation.store(true, std::memory_order_release);
         record_creation_color_default(*result_swapchain, binding_scope.id(),
                                       binding_scope.depth());
     }
@@ -1700,16 +1829,20 @@ HRESULT STDMETHODCALLTYPE create_swapchain_for_hwnd_detour(
     const DXGI_SWAP_CHAIN_DESC1* desc,
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc,
     IDXGIOutput* restrict_to_output, IDXGISwapChain1** result_swapchain) {
+    if (!g_adoption_probe_in_progress)
+        g_creation_detour_calls.fetch_add(1, std::memory_order_relaxed);
     BindingScope binding_scope(g_creation_transaction);
     const HRESULT result = g_next_create_swapchain_for_hwnd(
         factory, queue, hwnd, desc, fullscreen_desc, restrict_to_output,
         result_swapchain);
-    if (!g_stopping.load(std::memory_order_acquire) && SUCCEEDED(result) &&
+    if (!g_adoption_probe_in_progress &&
+        !g_stopping.load(std::memory_order_acquire) && SUCCEEDED(result) &&
         result_swapchain && *result_swapchain &&
         eligible_shadow_candidate(*result_swapchain) &&
         install_swapchain_shadow(*result_swapchain) &&
         bind_swapchain_queue(*result_swapchain, queue,
                              binding_scope.id(), binding_scope.depth())) {
+        g_observed_creation.store(true, std::memory_order_release);
         record_creation_color_default(*result_swapchain, binding_scope.id(),
                                       binding_scope.depth());
     }
@@ -1777,6 +1910,452 @@ bool is_elden_ring_process() noexcept {
         if (*cursor == L'\\' || *cursor == L'/') name = cursor + 1;
     }
     return lstrcmpiW(name, L"eldenring.exe") == 0;
+}
+
+// -------------------------------------------------------------------------
+// Late adoption of an already-existing swapchain
+//
+// The creation detours are the authoritative discovery and queue-association
+// path, but they can only ever observe creations that happen after they are
+// installed. When this mod is loaded late the game's swapchain (and its
+// direct command queue) already exist. Adoption recovers from that with the
+// backend's evidence rules intact:
+//
+//  * The swapchain INSTANCE is found by pass-through observer hooks on the
+//    shared IDXGISwapChain::Present/Present1 implementations. They perform no
+//    rendering and are never removed once installed (an unknown multi-mod
+//    chain must not lose an edge); after adoption resolves they are a single
+//    atomic load and a tail call.
+//  * The exact queue is first requested from DXGI itself
+//    (GetDevice(ID3D12CommandQueue)); measured on Windows 11 23H2 this
+//    returns E_NOINTERFACE, but the call is exact if any DXGI build honors
+//    it, so it stays as the first choice.
+//  * Otherwise an ELDEN-RING-SPECIFIC correlation adapter may promote the
+//    device's single active direct queue: presentation requires a direct
+//    queue on the swapchain's device, so when exactly one direct queue has
+//    ever submitted on that device, the association queue can only be that
+//    queue or a queue that never executes -- and a presenting game renders
+//    on its association queue every frame. Any second direct queue, or a
+//    same-thread submit disagreeing with the candidate, permanently fails
+//    adoption closed. Generic (non-Elden-Ring) embeddings of this backend
+//    never promote correlation evidence and simply stay pass-through.
+//
+// Color for an adopted chain cannot use the creation-default rule (the game
+// may have called SetColorSpace1 before this mod loaded), so arming issues
+// one direct NVAPI GET to seed the existing vendor color observations. On
+// systems without NVAPI, R10/FP16 adopted chains keep failing closed exactly
+// like a detected wrapper does today.
+
+constexpr uint32_t kAdoptionMinimumQueueCalls = 128;
+constexpr uint32_t kAdoptionMinimumPresents = 32;
+constexpr uint32_t kAdoptionMaximumInstallAttempts = 64;
+
+struct AdoptionQueueEvidence {
+    // queue_identity doubles as the slot-published flag: it is stored with
+    // release order only after every other field is complete.
+    std::atomic<void*> queue_identity{nullptr};
+    void* device_identity = nullptr;
+    ID3D12CommandQueue* queue = nullptr; // AddRef'd; retained for process life
+    std::atomic<uint32_t> calls{0};
+};
+constexpr size_t kMaximumAdoptionQueues = 8;
+AdoptionQueueEvidence g_adoption_queues[kMaximumAdoptionQueues];
+std::atomic<uint32_t> g_adoption_queue_count{0};
+std::atomic<bool> g_adoption_queue_overflow{false};
+SRWLOCK g_adoption_queue_insert_lock = SRWLOCK_INIT;
+
+// Per-thread submit correlation. The cached interface pointer avoids a
+// QueryInterface per ExecuteCommandLists call on the hot pending path.
+thread_local ID3D12CommandQueue* g_tls_ecl_cached_pointer = nullptr;
+thread_local AdoptionQueueEvidence* g_tls_ecl_cached_slot = nullptr;
+thread_local void* g_tls_last_direct_queue_identity = nullptr;
+
+AdoptionState adoption_state() noexcept {
+    return static_cast<AdoptionState>(
+        g_adoption_state.load(std::memory_order_acquire));
+}
+
+void set_adoption_state(AdoptionState state) noexcept {
+    g_adoption_state.store(static_cast<uint32_t>(state),
+                           std::memory_order_release);
+}
+
+AdoptionQueueEvidence* record_adoption_queue(
+    ID3D12CommandQueue* queue) noexcept {
+    void* const identity = com_identity(queue);
+    if (!identity) return nullptr;
+    if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return nullptr;
+
+    const uint32_t published =
+        g_adoption_queue_count.load(std::memory_order_acquire);
+    for (uint32_t index = 0; index < published; ++index) {
+        if (g_adoption_queues[index].queue_identity.load(
+                std::memory_order_acquire) == identity)
+            return &g_adoption_queues[index];
+    }
+
+    AcquireSRWLockExclusive(&g_adoption_queue_insert_lock);
+    AdoptionQueueEvidence* result = nullptr;
+    const uint32_t count =
+        g_adoption_queue_count.load(std::memory_order_acquire);
+    for (uint32_t index = 0; index < count && !result; ++index) {
+        if (g_adoption_queues[index].queue_identity.load(
+                std::memory_order_acquire) == identity)
+            result = &g_adoption_queues[index];
+    }
+    if (!result) {
+        if (count >= kMaximumAdoptionQueues) {
+            g_adoption_queue_overflow.store(true, std::memory_order_release);
+        } else {
+            ComPtr<ID3D12Device> device;
+            if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) && device) {
+                AdoptionQueueEvidence& slot = g_adoption_queues[count];
+                slot.device_identity = com_identity(device.Get());
+                slot.queue = queue;
+                queue->AddRef();
+                slot.queue_identity.store(identity, std::memory_order_release);
+                g_adoption_queue_count.store(count + 1,
+                                             std::memory_order_release);
+                result = &slot;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_adoption_queue_insert_lock);
+    return result;
+}
+
+void STDMETHODCALLTYPE execute_command_lists_observer(
+    ID3D12CommandQueue* queue, UINT count,
+    ID3D12CommandList* const* lists) {
+    if (adoption_state() == AdoptionState::Pending && queue) {
+        if (queue != g_tls_ecl_cached_pointer) {
+            g_tls_ecl_cached_pointer = queue;
+            g_tls_ecl_cached_slot = record_adoption_queue(queue);
+        }
+        if (AdoptionQueueEvidence* slot = g_tls_ecl_cached_slot) {
+            slot->calls.fetch_add(1, std::memory_order_relaxed);
+            g_tls_last_direct_queue_identity =
+                slot->queue_identity.load(std::memory_order_relaxed);
+        }
+    }
+    g_next_execute_command_lists(queue, count, lists);
+}
+
+// Serializes candidate tracking and the adopt transaction. Contention is
+// effectively zero (one game render thread); a losing Present skips a tick.
+SRWLOCK g_adoption_try_lock = SRWLOCK_INIT;
+struct AdoptionCandidate {
+    IDXGISwapChain* instance = nullptr; // continuity key; only dereferenced
+                                        // while it is the current caller
+    uint32_t consecutive_presents = 0;
+    uint64_t last_seen_ms = 0;
+    uint32_t install_attempts = 0;
+    bool seen_logged = false;
+    bool waiting_logged = false;
+} g_adoption_candidate;
+
+void adoption_failed_locked(const char* reason) noexcept {
+    set_adoption_state(AdoptionState::Failed);
+    flog("[overlay-v2] [WARN] swapchain adoption disabled: %s", reason);
+}
+
+void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
+    if (!TryAcquireSRWLockExclusive(&g_adoption_try_lock)) return;
+    try {
+        do {
+            if (adoption_state() != AdoptionState::Pending ||
+                g_stopping.load(std::memory_order_acquire))
+                break;
+            // Chains shadowed by the creation path (or a prior adoption) need
+            // nothing further; this also makes the shadow's own downstream
+            // Present call a no-op here.
+            if (dxgi_shadow::generation_token(swapchain) != 0) break;
+            if (!eligible_shadow_candidate(swapchain)) break;
+
+            AdoptionCandidate& candidate = g_adoption_candidate;
+            const uint64_t now = now_ticks();
+            if (candidate.instance == swapchain &&
+                now - candidate.last_seen_ms <= 500) {
+                candidate.consecutive_presents =
+                    std::min(candidate.consecutive_presents + 1, 1000u);
+            } else {
+                candidate.instance = swapchain;
+                candidate.consecutive_presents = 1;
+                candidate.install_attempts = 0;
+            }
+            candidate.last_seen_ms = now;
+            if (!candidate.seen_logged && candidate.consecutive_presents >= 8) {
+                candidate.seen_logged = true;
+                flog("[overlay-v2] adoption: found a live game swapchain; "
+                     "gathering exact-queue evidence");
+            }
+            if (candidate.consecutive_presents < kAdoptionMinimumPresents)
+                break;
+
+            // First choice: exact retrieval from DXGI. E_NOINTERFACE on every
+            // Windows build measured so far, but exact if it ever succeeds.
+            ComPtr<ID3D12CommandQueue> queue;
+            if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&queue))))
+                queue.Reset();
+            bool correlated = false;
+            if (!queue) {
+                if (!is_elden_ring_process()) {
+                    adoption_failed_locked(
+                        "DXGI does not expose the creation queue and the "
+                        "single-queue correlation adapter is Elden Ring "
+                        "specific");
+                    break;
+                }
+                if (g_adoption_queue_overflow.load(std::memory_order_acquire)) {
+                    adoption_failed_locked(
+                        "too many distinct direct command queues to reason "
+                        "about");
+                    break;
+                }
+                ComPtr<ID3D12Device> device;
+                if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&device))) ||
+                    !device)
+                    break;
+                void* const device_identity = com_identity(device.Get());
+                AdoptionQueueEvidence* match = nullptr;
+                bool ambiguous = false;
+                const uint32_t published =
+                    g_adoption_queue_count.load(std::memory_order_acquire);
+                for (uint32_t index = 0; index < published; ++index) {
+                    AdoptionQueueEvidence& slot = g_adoption_queues[index];
+                    if (!slot.queue_identity.load(std::memory_order_acquire) ||
+                        slot.device_identity != device_identity)
+                        continue;
+                    if (match) {
+                        ambiguous = true;
+                        break;
+                    }
+                    match = &slot;
+                }
+                if (ambiguous) {
+                    adoption_failed_locked(
+                        "multiple direct command queues are active on the "
+                        "game device; the overlay cannot prove which one "
+                        "presents");
+                    break;
+                }
+                if (!match ||
+                    match->calls.load(std::memory_order_relaxed) <
+                        kAdoptionMinimumQueueCalls) {
+                    if (!candidate.waiting_logged) {
+                        candidate.waiting_logged = true;
+                        flog("[overlay-v2] adoption: waiting for sustained "
+                             "single-queue submit evidence");
+                    }
+                    break;
+                }
+                // The presenting thread's own last direct submit must not
+                // contradict the single-queue conclusion.
+                if (g_tls_last_direct_queue_identity &&
+                    g_tls_last_direct_queue_identity !=
+                        match->queue_identity.load(std::memory_order_acquire)) {
+                    adoption_failed_locked(
+                        "the presenting thread submits on a different direct "
+                        "queue than the only observed one");
+                    break;
+                }
+                queue = match->queue;
+                correlated = true;
+            }
+            if (!queue) break;
+
+            BindingScope binding_scope(g_creation_transaction);
+            if (!install_swapchain_shadow(swapchain)) {
+                if (++candidate.install_attempts >=
+                    kAdoptionMaximumInstallAttempts)
+                    adoption_failed_locked(
+                        "the live swapchain repeatedly refused a vtable "
+                        "shadow");
+                break;
+            }
+            if (!bind_swapchain_queue(swapchain, queue.Get(),
+                                      binding_scope.id(),
+                                      binding_scope.depth())) {
+                adoption_failed_locked(
+                    "the recovered queue failed exact-identity validation");
+                break;
+            }
+            set_adoption_state(AdoptionState::Adopted);
+            flog("[overlay-v2] adopted the live game swapchain (queue "
+                 "evidence: %s)",
+                 correlated ? "single active direct queue, Elden Ring adapter"
+                            : "recovered from the swapchain itself");
+        } while (false);
+    } catch (...) {
+        // Adoption is strictly optional; never let it disturb the host call.
+    }
+    ReleaseSRWLockExclusive(&g_adoption_try_lock);
+}
+
+HRESULT STDMETHODCALLTYPE present_observer_detour(IDXGISwapChain* swapchain,
+                                                  UINT sync_interval,
+                                                  UINT flags) {
+    if (adoption_state() == AdoptionState::Pending && swapchain &&
+        (flags & DXGI_PRESENT_TEST) == 0)
+        try_adopt_swapchain(swapchain);
+    return g_next_present_observed(swapchain, sync_interval, flags);
+}
+
+HRESULT STDMETHODCALLTYPE present1_observer_detour(
+    IDXGISwapChain1* swapchain, UINT sync_interval, UINT flags,
+    const DXGI_PRESENT_PARAMETERS* parameters) {
+    if (adoption_state() == AdoptionState::Pending && swapchain &&
+        (flags & DXGI_PRESENT_TEST) == 0)
+        try_adopt_swapchain(swapchain);
+    return g_next_present1_observed(swapchain, sync_interval, flags,
+                                    parameters);
+}
+
+// Resolve the shared Present/Present1/ExecuteCommandLists implementations
+// from a throwaway device + hidden swapchain. Nothing is ever presented or
+// submitted, and everything is released before the observer hooks install, so
+// the probe can never be seen (or adopted) by the observers. The window is a
+// 64x64 tool window, which additionally fails both valid_creation_window and
+// the minimum-canvas gates.  Because this mod intercepts CreateSwapChainForHwnd
+// through the factory vtable slot, the probe's own creation dispatches into our
+// detour; g_adoption_probe_in_progress makes that a pass-through no-op.
+bool resolve_adoption_targets(void** present_target, void** present1_target,
+                              void** execute_target) noexcept {
+    g_adoption_probe_in_progress = true;
+    HWND hwnd = nullptr;
+    bool class_registered = false;
+    bool ok = false;
+    const wchar_t* const kProbeClass =
+        coexist::kAdoptionProbeWindowClass;
+    do {
+        ComPtr<IDXGIFactory2> factory;
+        if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))) || !factory)
+            break;
+        ComPtr<ID3D12Device> device;
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                     IID_PPV_ARGS(&device))) || !device)
+            break;
+        D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ComPtr<ID3D12CommandQueue> queue;
+        if (FAILED(device->CreateCommandQueue(&queue_desc,
+                                              IID_PPV_ARGS(&queue))) || !queue)
+            break;
+
+        WNDCLASSW window_class{};
+        window_class.lpfnWndProc = DefWindowProcW;
+        // The class belongs to this DLL, not the executable. Its per-mod name
+        // prevents two delayed backend copies from racing on registration
+        // before either one reaches the shared hook-install mutex.
+        window_class.hInstance = g_hinst;
+        window_class.lpszClassName = kProbeClass;
+        class_registered = RegisterClassW(&window_class) != 0;
+        if (!class_registered) {
+            flog("[overlay-v2] [ERROR] adoption probe class registration "
+                 "failed (err %lu)", GetLastError());
+            break;
+        }
+        hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kProbeClass, L"",
+                               WS_OVERLAPPED, 0, 0, 64, 64, nullptr, nullptr,
+                               window_class.hInstance, nullptr);
+        if (!hwnd) break;
+
+        DXGI_SWAP_CHAIN_DESC1 desc{};
+        desc.Width = 64;
+        desc.Height = 64;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 2;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        ComPtr<IDXGISwapChain1> probe;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue.Get(), hwnd, &desc,
+                                                   nullptr, nullptr,
+                                                   &probe)) || !probe)
+            break;
+
+        void** const swapchain_vtable =
+            *reinterpret_cast<void***>(probe.Get());
+        void** const queue_vtable = *reinterpret_cast<void***>(queue.Get());
+        if (!swapchain_vtable || !queue_vtable) break;
+        *present_target = swapchain_vtable[8];    // IDXGISwapChain::Present
+        *present1_target = swapchain_vtable[22];  // IDXGISwapChain1::Present1
+        *execute_target = queue_vtable[10]; // ID3D12CommandQueue::ExecuteCommandLists
+
+        // Field diagnostic: whether this DXGI build supports exact queue
+        // retrieval. Windows 11 23H2 measures E_NOINTERFACE.
+        ComPtr<ID3D12CommandQueue> retrieved;
+        flog("[overlay-v2] adoption probe: swapchain->GetDevice("
+             "ID3D12CommandQueue) is %s on this system",
+             SUCCEEDED(probe->GetDevice(IID_PPV_ARGS(&retrieved)))
+                 ? "supported" : "unavailable");
+        ok = *present_target && *present1_target && *execute_target;
+    } while (false);
+    if (hwnd) DestroyWindow(hwnd);
+    if (class_registered)
+        UnregisterClassW(kProbeClass, g_hinst);
+    g_adoption_probe_in_progress = false;
+    return ok;
+}
+
+// One direct NVAPI GET so an adopted R10/FP16 chain can prove its current
+// encoding; the game's own HDR SETs happened before this mod loaded. Calls
+// nvapi64 directly (never through the game's hooked wrappers). Absence of
+// NVAPI (AMD/Intel) is not an error: those chains keep failing closed.
+void query_nvapi_current_hdr(HWND game_window) noexcept {
+    constexpr uint32_t kNvapiIdInitialize = 0x0150E828u;
+    constexpr uint32_t kNvapiIdGetDisplayIdByDisplayName = 0xAE457190u;
+    constexpr uint32_t kNvapiIdDispHdrColorControl = 0x351DA224u;
+    constexpr uint32_t kHdrColorDataV1 = 0x00010028u;
+
+    HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+    if (!nvapi) {
+        flog("[overlay-v2] adoption: nvapi64 is not loaded; HDR-capable "
+             "swapchain encodings stay unverified");
+        return;
+    }
+    using QueryInterfaceFn = void*(__cdecl*)(uint32_t);
+    const auto query_interface = reinterpret_cast<QueryInterfaceFn>(
+        GetProcAddress(nvapi, "nvapi_QueryInterface"));
+    if (!query_interface) return;
+    using InitializeFn = int(__cdecl*)();
+    using GetDisplayIdFn = int(__cdecl*)(const char*, uint32_t*);
+    using HdrColorControlFn = int(__cdecl*)(uint32_t, void*);
+    const auto initialize =
+        reinterpret_cast<InitializeFn>(query_interface(kNvapiIdInitialize));
+    const auto get_display_id = reinterpret_cast<GetDisplayIdFn>(
+        query_interface(kNvapiIdGetDisplayIdByDisplayName));
+    const auto hdr_color_control = reinterpret_cast<HdrColorControlFn>(
+        query_interface(kNvapiIdDispHdrColorControl));
+    if (!initialize || !get_display_id || !hdr_color_control) return;
+    if (initialize() != 0) return; // refcounted; game holds it initialized
+
+    const auto output_name = monitor_output_name(
+        MonitorFromWindow(game_window, MONITOR_DEFAULTTOPRIMARY));
+    if (output_name[0] == '\0') return;
+    uint32_t display_id = 0;
+    if (get_display_id(output_name.data(), &display_id) != 0) {
+        flog("[overlay-v2] adoption: NvAPI display lookup failed for %s",
+             output_name.data());
+        return;
+    }
+    alignas(8) unsigned char color_data[40] = {};
+    auto* header = reinterpret_cast<NvapiHdrColorDataHeader*>(color_data);
+    header->version = kHdrColorDataV1;
+    header->command = static_cast<int32_t>(NvapiHdrCommand::Get);
+    if (hdr_color_control(display_id, header) != 0) {
+        flog("[overlay-v2] adoption: NvAPI HDR state query failed; encoding "
+             "stays unverified");
+        return;
+    }
+    try {
+        record_nvapi_display_binding(output_name, display_id);
+        record_nvapi_color_observation(display_id, header->hdr_mode,
+                                       "the overlay's direct query");
+    } catch (...) {
+        // Optional evidence only.
+    }
 }
 
 void* find_nvapi_wrapper(const std::array<uint8_t, 13>& prefix,
@@ -1906,6 +2485,10 @@ bool install_all_hooks(const HookTargets& target) {
     if (slots_installed) {
         flog("[overlay-v2] DXGI creation intercepted via factory vtable slots "
              "(coexists with code-patching overlays)");
+        // Forensics inspects the slots we actually replaced, not the (still
+        // pristine) code prologue -- see log_creation_hook_forensics.
+        g_forensics_create_swapchain_slot = target.factory_vtable + 10;
+        g_forensics_create_swapchain_for_hwnd_slot = target.factory_vtable + 15;
     } else {
         flog("[overlay-v2] [WARN] factory vtable interception unavailable; "
              "falling back to code patching");
@@ -1915,6 +2498,9 @@ bool install_all_hooks(const HookTargets& target) {
         ok &= queue_hook(target.create_swapchain_for_hwnd,
                          reinterpret_cast<void*>(&create_swapchain_for_hwnd_detour),
                          g_next_create_swapchain_for_hwnd, "CreateSwapChainForHwnd");
+        g_forensics_create_swapchain_target = target.create_swapchain;
+        g_forensics_create_swapchain_for_hwnd_target =
+            target.create_swapchain_for_hwnd;
     }
 
     bool nvapi_targets_present = false;
@@ -1955,6 +2541,157 @@ bool install_all_hooks(const HookTargets& target) {
         }
     }
     return true;
+}
+
+// -------------------------------------------------------------------------
+// Creation-hook forensics
+
+// SEH-guarded copy in a function with no unwindable objects. The inspected
+// addresses are hooked code and normally readable; a peer unmapping its
+// module is the case this guards against.
+bool safe_read_bytes(const void* source, void* destination,
+                     size_t size) noexcept {
+    __try {
+        std::memcpy(destination, source, size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// MinHook does not always write a jump straight to the detour.  When the
+// target and the detour are more than +-2 GB apart it writes the rel32 jump to
+// a VirtualAlloc'd relay page, which then does `jmp qword ptr [rip+0]` to the
+// real detour.  That page belongs to no module, so naively reporting the rel32
+// destination accuses a peer mod of overwriting a hook that is in fact intact
+// -- and which loader placed this DLL near dxgi.dll decides whether it
+// happens at all.  Follow the chain a couple of hops before concluding
+// anything.
+const void* follow_jump_chain(const void* destination) noexcept {
+    for (int hop = 0; hop < 4 && destination; ++hop) {
+        uint8_t bytes[16]{};
+        if (!safe_read_bytes(destination, bytes, sizeof(bytes))) break;
+        const auto* code = static_cast<const uint8_t*>(destination);
+        if (bytes[0] == 0xE9) {
+            int32_t displacement = 0;
+            std::memcpy(&displacement, bytes + 1, sizeof(displacement));
+            destination = code + 5 + displacement;
+            continue;
+        }
+        if (bytes[0] == 0xFF && bytes[1] == 0x25) {
+            int32_t displacement = 0;
+            std::memcpy(&displacement, bytes + 2, sizeof(displacement));
+            const void* slot = code + 6 + displacement;
+            void* next = nullptr;
+            if (!safe_read_bytes(slot, &next, sizeof(next))) break;
+            destination = next;
+            continue;
+        }
+        break;
+    }
+    return destination;
+}
+
+void log_patch_owner(const char* name, const char* patch_kind,
+                     const void* destination) noexcept {
+    HMODULE module = nullptr;
+    wchar_t path[MAX_PATH]{};
+    const wchar_t* base_name = L"unmapped memory";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(destination), &module) &&
+        module && GetModuleFileNameW(module, path, MAX_PATH)) {
+        base_name = path;
+        for (const wchar_t* cursor = path; *cursor != L'\0'; ++cursor) {
+            if (*cursor == L'\\' || *cursor == L'/') base_name = cursor + 1;
+        }
+    }
+    flog("[overlay-v2] forensics: %s prologue is a %s into %ls at %p -- "
+         "a mod that hooked after this one (legitimate if it chains back) "
+         "or one that overwrote this mod's hook",
+         name, patch_kind, base_name, destination);
+}
+
+// Code-patch mode (fallback): inspect the dxgi entrypoint's prologue.
+void log_creation_target_forensics(const char* name, void* target,
+                                   const void* detour) noexcept {
+    if (!target) return;
+    uint8_t bytes[16]{};
+    if (!safe_read_bytes(target, bytes, sizeof(bytes))) {
+        flog("[overlay-v2] forensics: %s target %p is unreadable", name,
+             target);
+        return;
+    }
+    const auto* code = static_cast<const uint8_t*>(target);
+    if (bytes[0] == 0xE9) { // rel32 jmp -- what MinHook writes
+        int32_t displacement = 0;
+        std::memcpy(&displacement, bytes + 1, sizeof(displacement));
+        const void* destination = code + 5 + displacement;
+        if (destination != detour && follow_jump_chain(destination) == detour) {
+            flog("[overlay-v2] forensics: %s patch is intact (through "
+                 "MinHook's relay at %p) -- the chain still enters this "
+                 "mod's detour",
+                 name, destination);
+            return;
+        }
+        if (destination == detour) {
+            flog("[overlay-v2] forensics: %s patch is intact -- the jump "
+                 "still enters this mod's detour",
+                 name);
+        } else {
+            log_patch_owner(name, "relative jump", destination);
+        }
+        return;
+    }
+    if (bytes[0] == 0xFF && bytes[1] == 0x25) { // jmp [rip+disp32]
+        int32_t displacement = 0;
+        std::memcpy(&displacement, bytes + 2, sizeof(displacement));
+        const void* slot = code + 6 + displacement;
+        void* destination = nullptr;
+        if (safe_read_bytes(slot, &destination, sizeof(destination))) {
+            if (destination == detour ||
+                follow_jump_chain(destination) == detour)
+                flog("[overlay-v2] forensics: %s patch is intact -- the "
+                     "indirect jump still enters this mod's detour",
+                     name);
+            else
+                log_patch_owner(name, "absolute indirect jump", destination);
+        } else
+            flog("[overlay-v2] forensics: %s prologue is an indirect jump "
+                 "through unreadable memory", name);
+        return;
+    }
+    flog("[overlay-v2] forensics: %s prologue bytes %02X %02X %02X %02X "
+         "%02X are not a recognized detour patch -- this mod's hook was "
+         "overwritten or removed",
+         name, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]);
+}
+
+// Slot mode (default for this mod): inspect the factory vtable entry we
+// replaced.  A slot that no longer points at our detour was taken by another
+// tool -- legitimate if that tool captured our pointer as its immediate-next.
+void log_creation_slot_forensics(const char* name, void** slot,
+                                 const void* detour) noexcept {
+    if (!slot) return;
+    void* current = nullptr;
+    if (!safe_read_bytes(slot, &current, sizeof(current))) {
+        flog("[overlay-v2] forensics: %s vtable slot %p is unreadable", name,
+             static_cast<void*>(slot));
+        return;
+    }
+    if (current == detour) {
+        flog("[overlay-v2] forensics: %s factory vtable slot still points at "
+             "this mod's detour (intact)",
+             name);
+        return;
+    }
+    if (follow_jump_chain(current) == detour) {
+        flog("[overlay-v2] forensics: %s factory vtable slot chains back to "
+             "this mod's detour (intact)",
+             name);
+        return;
+    }
+    log_patch_owner(name, "factory vtable slot", current);
 }
 
 } // namespace
@@ -2020,6 +2757,102 @@ bool install_hooks() {
 
 bool hooks_installed() {
     return g_installed.load(std::memory_order_acquire);
+}
+
+bool observed_swapchain_creation() {
+    return g_observed_creation.load(std::memory_order_acquire);
+}
+
+void log_creation_hook_forensics() {
+    if (!g_installed.load(std::memory_order_acquire)) {
+        flog("[overlay-v2] forensics: creation hooks were never installed");
+        return;
+    }
+    flog("[overlay-v2] forensics: this mod's DXGI creation detours have run "
+         "%u time(s) since load",
+         g_creation_detour_calls.load(std::memory_order_relaxed));
+    if (g_forensics_create_swapchain_slot ||
+        g_forensics_create_swapchain_for_hwnd_slot) {
+        // Default path: interception is via factory vtable slots.
+        log_creation_slot_forensics(
+            "CreateSwapChain", g_forensics_create_swapchain_slot,
+            reinterpret_cast<const void*>(&create_swapchain_detour));
+        log_creation_slot_forensics(
+            "CreateSwapChainForHwnd", g_forensics_create_swapchain_for_hwnd_slot,
+            reinterpret_cast<const void*>(&create_swapchain_for_hwnd_detour));
+    } else {
+        // Fallback path: interception is a code patch on the dxgi entrypoint.
+        log_creation_target_forensics(
+            "CreateSwapChain", g_forensics_create_swapchain_target,
+            reinterpret_cast<const void*>(&create_swapchain_detour));
+        log_creation_target_forensics(
+            "CreateSwapChainForHwnd",
+            g_forensics_create_swapchain_for_hwnd_target,
+            reinterpret_cast<const void*>(&create_swapchain_for_hwnd_detour));
+    }
+}
+
+void arm_adoption(HWND game_window_hint) {
+    // Overlay/control thread only (matches g_adoption_hooks_installed use).
+    if (!g_installed.load(std::memory_order_acquire) ||
+        !g_renderer_ready.load(std::memory_order_acquire) ||
+        g_stopping.load(std::memory_order_acquire))
+        return;
+    if (adoption_state() == AdoptionState::Pending) return;
+
+    if (g_adoption_hooks_installed) {
+        // Re-arm: the observers are resident; only the search state resets.
+        // Covers a replacement swapchain being missed while the creation hook
+        // is dead (the same condition that required adoption initially).
+        AcquireSRWLockExclusive(&g_adoption_try_lock);
+        g_adoption_candidate = {};
+        ReleaseSRWLockExclusive(&g_adoption_try_lock);
+        set_adoption_state(AdoptionState::Pending);
+        query_nvapi_current_hdr(game_window_hint); // HDR may have changed
+        flog("[overlay-v2] swapchain adoption re-armed");
+        return;
+    }
+
+    void* present_target = nullptr;
+    void* present1_target = nullptr;
+    void* execute_target = nullptr;
+    if (!resolve_adoption_targets(&present_target, &present1_target,
+                                  &execute_target)) {
+        set_adoption_state(AdoptionState::Failed);
+        flog("[overlay-v2] [ERROR] adoption probe could not resolve the "
+             "Present/ExecuteCommandLists implementations; late adoption "
+             "unavailable");
+        return;
+    }
+    {
+        // Same serialization contract as every other hook batch (hooks.hpp).
+        hooks::InstallLock install_lock;
+        bool ok = true;
+        ok &= queue_hook(present_target,
+                         reinterpret_cast<void*>(&present_observer_detour),
+                         g_next_present_observed, "Present observer");
+        ok &= queue_hook(present1_target,
+                         reinterpret_cast<void*>(&present1_observer_detour),
+                         g_next_present1_observed, "Present1 observer");
+        ok &= queue_hook(
+            execute_target,
+            reinterpret_cast<void*>(&execute_command_lists_observer),
+            g_next_execute_command_lists, "ExecuteCommandLists observer");
+        ok &= hooks::apply();
+        if (!ok) {
+            // Partial installs stay resident as pass-through; adoption never
+            // activates them, mirroring the creation-batch failure policy.
+            set_adoption_state(AdoptionState::Failed);
+            flog("[overlay-v2] [ERROR] adoption hook transaction failed; "
+                 "late adoption unavailable");
+            return;
+        }
+    }
+    g_adoption_hooks_installed = true;
+    set_adoption_state(AdoptionState::Pending);
+    query_nvapi_current_hdr(game_window_hint);
+    flog("[overlay-v2] swapchain adoption armed: watching live presents for "
+         "the game swapchain");
 }
 
 Canvas canvas() {
@@ -2129,6 +2962,11 @@ void shutdown() {
         g_primary_generation = 0;
         g_primary_hwnd = nullptr;
         g_color_unknown_logged_generation = 0;
+        g_present_reached_logged_generation = 0;
+        g_describe_reject_logged_generation = 0;
+        g_describe_reject_reason = nullptr;
+        g_primary_block_reason = nullptr;
+        g_queue_missing_logged_generation = 0;
         g_resize_gate = {};
         g_color_gate = {};
         g_pending_composited_buffer = {};

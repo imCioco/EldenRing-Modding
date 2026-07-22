@@ -4,6 +4,14 @@ project(CustomTalismanEffects LANGUAGES C CXX RC)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Injected release DLLs must not depend on a matching Visual C++ runtime being
+# installed inside the game's Wine/Proton prefix. Set this before libER is
+# added so both this target and its static C++ dependency use the same runtime.
+if(MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY
+      "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # ---- version resource ------------------------------------------------------
 # release/version.md is the single source of truth (build.bat bumps it BEFORE
 # configuring, so the DLL embeds exactly the version that ships). The generated
@@ -61,6 +69,7 @@ add_subdirectory("external/libER" "libER")
 add_library(${PROJECT_NAME} SHARED
     src/main.cpp
     src/log.cpp
+    src/runtime_compat.cpp
     src/offsets.cpp
     src/game_access.cpp
     src/state.cpp
@@ -109,6 +118,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 # built-in Win32 gamepad polling.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
+    QP_BACKEND_MOD_ID=CustomTalismanEffects
     CTE_VERSION="${CTE_VERSION}")
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
 

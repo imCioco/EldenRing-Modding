@@ -50,8 +50,9 @@ namespace cte::hooks {
 // pointless. Do not rename it; see overlay_coexist.hpp.
 //
 // Acquisition is bounded: a mod that dies holding the mutex must not wedge
-// ours. A timeout or an abandoned mutex both proceed unlocked (logged), which
-// is exactly the previous unserialized behavior -- never worse.
+// ours. An abandoned mutex is acquired and logged (Win32 transfers ownership);
+// a timeout proceeds unlocked and logged, which is exactly the previous
+// unserialized behavior -- never worse.
 class InstallLock {
   public:
     InstallLock();

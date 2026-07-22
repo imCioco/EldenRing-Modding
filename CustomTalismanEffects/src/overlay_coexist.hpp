@@ -11,7 +11,7 @@
 //
 // There are two kinds of name, and they must be treated oppositely:
 //
-//   SHARED  (kHookInstallMutex in hooks.hpp, kMenuOwnerMutex below)
+//   SHARED  (kHookInstallMutexName, kMenuOwnerMutexName below)
 //           Arbitration primitives. Every mod embedding this backend must use
 //           the IDENTICAL string or the arbitration does nothing. NEVER
 //           rename these -- not even to something CTE-flavored. They are
@@ -19,7 +19,7 @@
 //           because that is the string QuestPath already ships; renaming here
 //           would silently un-arbitrate both mods.
 //
-//   PRIVATE (kInputWindowClass below)
+//   PRIVATE (kInputWindowClass, kAdoptionProbeWindowClass below)
 //           Per-mod resources that must NOT collide. RegisterClassExW fails
 //           with ERROR_CLASS_ALREADY_EXISTS if a second mod registers the same
 //           class name in the same process, which kills its input sink and
@@ -30,13 +30,44 @@
 
 namespace cte::coexist {
 
-// PRIVATE. Everything below derives from it. Identifier-safe (no spaces or
-// backslashes) -- it goes into a window class name.
-constexpr const wchar_t* kModName = L"CustomTalismanEffects";
+// PORTING: set QP_BACKEND_MOD_ID to a unique identifier for each mod (the CTE
+// CMake target does this). Keep it identifier-safe: it is stringized into
+// Win32 class names. All PRIVATE names derive from it automatically.
+#ifndef QP_BACKEND_MOD_ID
+#define QP_BACKEND_MOD_ID CustomTalismanEffects
+#endif
+#define QP_COEXIST_STRING_IMPL(value) #value
+#define QP_COEXIST_STRING(value) QP_COEXIST_STRING_IMPL(value)
+#define QP_COEXIST_WIDEN_IMPL(value) L##value
+#define QP_COEXIST_WIDEN(value) QP_COEXIST_WIDEN_IMPL(value)
+#define QP_COEXIST_WIDE_STRING(value) \
+    QP_COEXIST_WIDEN(QP_COEXIST_STRING(value))
+
+inline constexpr wchar_t kModName[] =
+    QP_COEXIST_WIDE_STRING(QP_BACKEND_MOD_ID);
+
+// SHARED. Every backend copy must use these exact protocol names.
+inline constexpr wchar_t kHookInstallMutexName[] =
+    L"Local\\QPBackend.HookInstall.v1";
+inline constexpr wchar_t kMenuOwnerMutexName[] =
+    L"Local\\QPBackend.MenuOwner.v1";
 
 // PRIVATE. Message-only HWND that owns our raw-input registration. Must differ
 // from QuestPath's "QuestPath_InputSink_V2".
-constexpr const wchar_t* kInputWindowClass = L"CustomTalismanEffects_InputSink_V2";
+inline constexpr wchar_t kInputWindowClass[] =
+    QP_COEXIST_WIDE_STRING(QP_BACKEND_MOD_ID) L"_InputSink_V2";
+
+// PRIVATE. Short-lived hidden HWND used only to resolve late-adoption method
+// targets. Two delayed backend copies can probe concurrently before either
+// reaches the shared hook lock, so this must be distinct per mod.
+inline constexpr wchar_t kAdoptionProbeWindowClass[] =
+    QP_COEXIST_WIDE_STRING(QP_BACKEND_MOD_ID) L"_AdoptionProbe_V2";
+
+#undef QP_COEXIST_WIDE_STRING
+#undef QP_COEXIST_WIDEN
+#undef QP_COEXIST_WIDEN_IMPL
+#undef QP_COEXIST_STRING
+#undef QP_COEXIST_STRING_IMPL
 
 // ── menu ownership ────────────────────────────────────────────────────────
 // Raw input is a per-process singleton: exactly one HWND receives keyboard and

@@ -1048,10 +1048,20 @@ void destroy_input_window() {
 // Refresh the control-thread coordinate mapping from the selected swapchain.
 // Backbuffer pixels and client pixels can differ under compatibility scaling;
 // cursor conversion accounts for that instead of assuming a 1:1 mapping.
+// Why the last refresh_canvas() failed, so the user-visible "menu requested
+// before a validated game swapchain was ready" line is triage-grade on its own.
+// Control thread only.
+const char* g_canvas_block_reason = "not evaluated yet";
+
 bool refresh_canvas() {
     const present::Canvas host = present::canvas();
     if (!host.ready || !host.hwnd || !IsWindow(host.hwnd) ||
         host.width < 2 || host.height < 2) {
+        g_canvas_block_reason =
+            !host.ready      ? "the backend has not published a ready canvas"
+            : !host.hwnd     ? "the published canvas has no window"
+            : !IsWindow(host.hwnd) ? "the published canvas window is gone"
+                             : "the published canvas is degenerate";
         g_game_hwnd = nullptr;
         g_back_w = g_back_h = 0;
         g_client_w = g_client_h = 0;
@@ -1060,11 +1070,17 @@ bool refresh_canvas() {
 
     RECT client{};
     POINT origin{};
-    if (!GetClientRect(host.hwnd, &client) || !ClientToScreen(host.hwnd, &origin))
+    if (!GetClientRect(host.hwnd, &client) || !ClientToScreen(host.hwnd, &origin)) {
+        g_canvas_block_reason = "the game window geometry is unreadable";
         return false;
+    }
     const int client_w = client.right - client.left;
     const int client_h = client.bottom - client.top;
-    if (client_w < 1 || client_h < 1) return false;
+    if (client_w < 1 || client_h < 1) {
+        g_canvas_block_reason = "the game client rect is empty";
+        return false;
+    }
+    g_canvas_block_reason = nullptr;
 
     g_game_hwnd = host.hwnd;
     g_back_w = host.width;
@@ -1073,6 +1089,39 @@ bool refresh_canvas() {
     g_client_w = client_w;
     g_client_h = client_h;
     return true;
+}
+
+// Does a plausible game window already exist in this process? Used to detect
+// a late load (the window -- and therefore the swapchain -- predates this
+// mod's DXGI creation hooks) and to pick the display for the adoption path's
+// vendor HDR query. Returns the largest qualifying window.
+HWND find_existing_game_window() {
+    struct Search {
+        HWND best = nullptr;
+        int best_area = 0;
+    } search;
+    EnumWindows(
+        [](HWND hwnd, LPARAM param) -> BOOL {
+            auto* search = reinterpret_cast<Search*>(param);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd) ||
+                GetAncestor(hwnd, GA_ROOT) != hwnd ||
+                (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0)
+                return TRUE;
+            RECT client{};
+            if (!GetClientRect(hwnd, &client)) return TRUE;
+            const int width = client.right - client.left;
+            const int height = client.bottom - client.top;
+            if (width < 640 || height < 360) return TRUE;
+            if (width * height > search->best_area) {
+                search->best_area = width * height;
+                search->best = hwnd;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&search));
+    return search.best;
 }
 
 bool init_frontend() {
@@ -1315,7 +1364,10 @@ void update_menu_toggle() {
             static ULONGLONG last_not_ready_log = 0;
             const ULONGLONG now = GetTickCount64();
             if (now - last_not_ready_log > 2000) {
-                flog("[overlay-v2] menu requested before a validated game swapchain was ready");
+                flog("[overlay-v2] menu requested before a validated game "
+                     "swapchain was ready: %s",
+                     g_canvas_block_reason ? g_canvas_block_reason
+                                           : "reason unrecorded");
                 last_not_ready_log = now;
             }
             toggled = false;
@@ -1469,17 +1521,37 @@ void overlay_thread() {
     ULONGLONG open_unavailable_since = 0;
     UINT last_scaled_height = 0;
 
-    // Swapchain discovery is one-shot (only the DXGI creation detours install
-    // shadows), so "we never saw a creation call" is silent and permanent --
-    // the user just gets "menu requested before a validated game swapchain was
-    // ready" on every keypress with no cause in the log. There is no safe
-    // recovery: re-creating the hook would need MH_RemoveHook first, which
-    // restores OUR backed-up prologue over whatever mod patched it after us.
-    // So this only diagnoses, loudly and once. Factory-slot interception plus
-    // hooks::InstallLock is what actually prevents the common cause -- a peer
-    // mod's interleaved install erasing our creation hook (hooks.hpp).
+    // Swapchain discovery is creation-first: the DXGI creation detours are
+    // the authoritative path (they capture the exact queue at creation). But
+    // that call can be missed -- a delayed loader/injector starts this mod
+    // after the game is already presenting, or a peer mod's unserialized
+    // install erases the creation hook (hooks.hpp). Both are recovered by
+    // present::arm_adoption(), which finds the live swapchain from
+    // pass-through Present observers and shadows it in place. Trigger it
+    // immediately when the game window predates the hooks, or from a 10s
+    // watchdog otherwise; forensics lines attribute the cause either way.
     const ULONGLONG discovery_started = GetTickCount64();
-    bool discovery_stall_reported = false;
+    bool discovery_stall_handled = false;
+    bool canvas_loss_adoption_armed = false;
+    // A visible game window here proves nothing on its own: bootstrap does
+    // config and flag-scanner work between installing the hooks and reaching
+    // this point, so the game can legitimately create AND present its
+    // swapchain in that gap. Only a window with no observed creation is a real
+    // late load. Arming adoption otherwise costs three extra process-wide
+    // detours and can never help anyway -- try_adopt_swapchain rejects any
+    // chain that already carries a shadow.
+    if (HWND existing = find_existing_game_window()) {
+        if (present::observed_swapchain_creation()) {
+            flog("[overlay-v2] game window already up, but the overlay observed "
+                 "its swapchain creation; adoption not needed");
+        } else {
+            flog("[overlay-v2] late load detected: the game window predates "
+                 "this mod's DXGI hooks; adopting the live swapchain");
+            present::log_creation_hook_forensics();
+            present::arm_adoption(existing);
+            discovery_stall_handled = true;
+        }
+    }
 
     while (g_running.load(std::memory_order_acquire)) {
         MSG msg;
@@ -1492,6 +1564,7 @@ void overlay_thread() {
         if (canvas_valid) {
             ever_had_canvas = true;
             canvas_lost_since = 0;
+            canvas_loss_adoption_armed = false;
             if (canvas_loss_reported) {
                 flog("[overlay-v2] game swapchain/window reacquired");
                 canvas_loss_reported = false;
@@ -1504,16 +1577,36 @@ void overlay_thread() {
                 g_menu_open.store(false, std::memory_order_release);
                 canvas_loss_reported = true;
             }
-        } else if (!discovery_stall_reported &&
-                   GetTickCount64() - discovery_started > 20000) {
-            discovery_stall_reported = true;
-            flog("[overlay-v2] [ERROR] no game swapchain discovered 20s after "
-                 "bootstrap -- the menu cannot open. Our DXGI creation detour "
-                 "never ran: either the game created its swapchain before we "
-                 "hooked, or another mod embedding this backend clobbered the "
-                 "hook by installing concurrently. This is not recoverable "
-                 "this session; restart the game. If a second such mod is "
-                 "loaded, confirm both builds contain hooks::InstallLock.");
+            // A replacement swapchain normally re-registers through the
+            // creation detour within a frame or two. If it still has not
+            // after 5s, assume the creation call was missed again (dead
+            // creation hook) and search the live presents instead.
+            if (GetTickCount64() - canvas_lost_since > 5000 &&
+                !canvas_loss_adoption_armed) {
+                canvas_loss_adoption_armed = true;
+                flog("[overlay-v2] replacement swapchain never registered; "
+                     "engaging live-swapchain adoption");
+                present::log_creation_hook_forensics();
+                present::arm_adoption(find_existing_game_window());
+            }
+        } else if (!discovery_stall_handled &&
+                   GetTickCount64() - discovery_started > 10000) {
+            discovery_stall_handled = true;
+            if (present::observed_swapchain_creation()) {
+                // Discovery worked; validation or presentation did not. The
+                // one-shot backend diagnostics name the gate -- adoption
+                // cannot help, because the chain is already shadowed.
+                flog("[overlay-v2] [WARN] no usable canvas 10s after "
+                     "bootstrap even though the overlay observed and shadowed "
+                     "the swapchain creation -- validation is rejecting it");
+            } else {
+                flog("[overlay-v2] [WARN] no game swapchain discovered 10s "
+                     "after bootstrap -- this mod's DXGI creation detour "
+                     "never saw the creation call; engaging live-swapchain "
+                     "adoption");
+                present::log_creation_hook_forensics();
+                present::arm_adoption(find_existing_game_window());
+            }
         }
 
         poll_gamepad();

@@ -108,6 +108,25 @@ The generator fails loudly if two talismans normalize to the same name (which wo
 
 Copy `CustomTalismanEffects.dll` + `CustomTalismanEffects.ini` into your mod loader's native-mod folder (e.g. the me3 profile folder), launch offline.
 
+### Linux / Steam Deck (Proton)
+
+CustomTalismanEffects remains a Windows x64 DLL under Proton. Load it through
+the same Windows native-mod loader inside Elden Ring's Proton prefix. The DLL
+and its static dependencies carry the MSVC runtime, so a separate Visual C++
+redistributable should not be required merely to load the mod.
+
+Start compatibility testing in SDR with optional overlays disabled. Add
+Gamescope HDR/VRR, Steam Overlay, MangoHud, frame generation, and other
+injectors one at a time only after the baseline works. Do not place arbitrary
+native `dxgi.dll` or `d3d12.dll` copies beside the game.
+
+At startup the log identifies Wine/Proton and the actual DXGI/D3D12 modules in
+use. If the mod directory is read-only, logging falls back to
+`%TEMP%/CustomTalismanEffects/logs/CustomTalismanEffects.log`. If no log exists
+in either location, the DLL did not reach its worker; check the mod loader and
+Proton log first. An unreadable `.ini` selects defaults and does not disable
+the overlay renderer.
+
 ## Logs
 
 Every launch writes `logs/CustomTalismanEffects.log` next to the DLL. A healthy run shows the apply function resolving, params loading, each enabled talisman resolving to its effect ids, and (with `log_each = 1`) each SpEffect as it's applied:
