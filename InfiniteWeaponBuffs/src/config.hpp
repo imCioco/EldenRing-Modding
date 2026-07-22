@@ -23,25 +23,53 @@ extern bool      g_debug;
 inline const int kHorseSummonGoodsBuiltin[]      = { 130 };
 inline const int kExtraConsumableGoodsBuiltin[]  = { 2003170 };
 
-// Built-in SpEffect ids for Ash-of-War self-buffs. Ashes apply their buff
-// through a weapon-skill behavior that can't be reached cleanly from the gem
-// param (SwordArtsParam has no SpEffect ref), so they're driven by this
-// allowlist; extend with [ashes_of_war] speffect_ids. Ids are the "Damage Buff"
-// effect rows (incl. No-FP variants) from soulsmods/Paramdex ER SpEffectParam
-// names -- the same set PersistentBuffs uses. Element weapon-enchant arts
-// (Cragblade, Flaming Strike, infusions) are intentionally excluded: like
-// greases they belong to the weapon, not the character. Add them via the .ini
-// if you want them too.
+// Built-in SpEffect ids for Ash-of-War buffs. Ashes apply their buff through a
+// weapon-skill behavior that can't be reached cleanly from the gem param
+// (SwordArtsParam has no SpEffect/bullet ref -- verified), so they're driven by
+// this curated allowlist; extend with [ashes_of_war] speffect_ids. Ids are the
+// buff-carrying rows (the "- ... Buff" effects, incl. No-FP variants) from
+// soulsmods/Paramdex ER SpEffectParam names. This now aims to cover EVERY
+// buff-granting Ash of War, including the element weapon-enchant arts (Cragblade,
+// Flaming Strike, infusions, etc.) -- previously excluded by choice. Intentionally
+// NOT listed: the bare trigger/FP-consume rows, "- VFX"/"- Icon"/"- Bullet" rows,
+// the on-hit status-application rows ("- Frost"/"- Poison"/"- Bleed" without
+// "Buff"), and the *self-cost* rows (Seppuku "- Self Bleed", Vyke "- Self
+// Madness", "- HP Burn", Determination/RKR "- Critical Damage Debuff") -- those
+// aren't buffs. `dump=1`'s "ASH-OF-WAR ALLOWLIST CHECK" verifies each id exists +
+// is timed on the live regulation.
 inline const std::vector<int> kAshOfWarBuffSpEffectsBuiltin = {
+    801, 803, 806, 809, 811, 814, // Barricade Shield (hardness/guard buff)
+    821, 823,                     // Sacred Blade (holy enchant)
+    826, 828,                     // Chilling Mist (frost enchant)
+    831, 833,                     // Poisonous Mist (poison enchant)
     841, 843, 846, 848,           // Roar
+    1511, 1513,                   // Stormhawk Axe (lightning enchant)
+    1540,                         // Raptor of the Mists (protection)
     1586, 1588,                   // Jellyfish Shield
+    1627, 1629,                   // Mohgwyn's Sacred Spear (fire enchant)
+    1640, 1641,                   // Holy Ground (defence + HP regen)
     1650, 1651, 1655, 1656,       // Endure (poise)
+    1676, 1678,                   // Lightning Slash (lightning enchant)
     1681, 1683, 1686, 1688,       // Barbaric/Milos Roar
     1691, 1693, 1696, 1698,       // Determination
     1701, 1703, 1706, 1708,       // Royal Knight's Resolve
-    1730, 1732,                   // Golden Vow
+    1716, 1718,                   // Golden Tempering (holy enchant)
+    1721, 1723,                   // Dark Moon Greatsword (frost/magic enchant)
+    1730, 1732,                   // Golden Vow / Golden Great Arrow
+    1755, 1758,                   // Seppuku (damage/bleed buff)
+    1765, 1766, 1767,             // Assassin's Gambit
+    1776, 1778,                   // Flaming Strike (fire enchant)
+    1791, 1793,                   // Eclipse Shotel (holy/blight enchant)
+    1806, 1808,                   // Ruinous Ghostflame (frost/magic enchant)
     1811, 1813, 1816, 1818,       // War Cry
+    1821, 1823, 1826, 1828,       // Cragblade
+    1835, 1836,                   // Last Rites (self + allies)
+    1841, 1843, 1846, 1848,       // Sacred Order
+    1850, 1851, 1852,             // Oath of Vengeance (stat + poise)
     1861, 1863, 1866, 1868,       // Braggart's Roar
+    1870, 1871,                   // Shared Order (self + allies)
+    1881, 1883,                   // Sword of St. Trina (sleep enchant)
+    1891, 1893,                   // Ice Lightning Sword (frost/lightning enchant)
 };
 
 // ---- dual-wield off-hand mirror: weapon-art enchant pairs ----

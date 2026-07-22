@@ -18,7 +18,7 @@ constexpr float kDualWieldCycleInterval  = 1.0f;   // rr->motionInterval, second
 constexpr float kDualWieldBridgeDuration = 2.0f;   // ll->effectEndurance, seconds
 
 int add_buffs(const std::vector<int>& entries, float dur,
-              bool followChain, bool requireSelf, bool requireBuff,
+              bool followChain, bool applyBuffFilter,
               const std::unordered_set<int>& protectedSp,
               std::unordered_map<int, float>& target,
               int* skippedNonBuff) {
@@ -35,8 +35,10 @@ int add_buffs(const std::vector<int>& entries, float dur,
         for (int t : timed) {
             if (protectedSp.count(t) || is_system_effect(t)) continue;
             auto* r = sp_row(t);
-            if (requireSelf && !is_self_buff(r)) continue;
-            if (requireBuff && !is_beneficial_buff(r)) {
+            // "Extend everything except debuffs": drop only effects that harm
+            // the bearer or target enemies only. Neutral/utility and self/ally
+            // buffs pass. (Trusted sources skip this entirely.)
+            if (applyBuffFilter && (is_debuff(r) || is_foe_only(r))) {
                 if (skippedNonBuff) ++*skippedNonBuff;
                 continue;
             }
@@ -81,22 +83,27 @@ void apply(const Ini& ini, const std::unordered_set<int>& extraGoods,
             if (!is_grease(row)) continue;
             std::vector<int> entries = { row.refId_default, row.refId_1 };
             added += add_buffs(entries, d, /*followChain*/false,
-                               /*requireSelf*/false, /*requireBuff*/false,
+                               /*applyBuffFilter*/false,
                                protectedSp, target);
         }
         flog("greases: %d effect(s) (duration=%.1f)", added, d);
     }
     if (ini.get_bool("spell_buffs", "enabled", true)) {
         const float d = ini.get_float("spell_buffs", "duration", -1.0f);
-        int added = 0;
+        int added = 0, skippedNonBuff = 0;
         for (auto [id, row] : from::param::Magic) {
             std::vector<int> entries;
             gather_magic_entries(row, entries);
-            added += add_buffs(entries, d, /*followChain*/false,
-                               /*requireSelf*/false, /*requireBuff*/false,
-                               protectedSp, target);
+            // Follow the chain (self+ally buffs land via a bullet -> chain) and
+            // filter: keep self/ally, non-debuff, timed -- so offensive spell
+            // payloads (enemy-only hit effects reached through the same bullets)
+            // are left alone.
+            added += add_buffs(entries, d, /*followChain*/true,
+                               /*applyBuffFilter*/true,
+                               protectedSp, target, &skippedNonBuff);
         }
-        flog("spell_buffs: %d effect(s) (duration=%.1f)", added, d);
+        flog("spell_buffs: %d effect(s) (duration=%.1f), %d non-buff skipped "
+             "(debuffs/enemy-targeted)", added, d, skippedNonBuff);
     }
     if (ini.get_bool("consumables", "enabled", true)) {
         const float d = ini.get_float("consumables", "duration", 300.0f);
@@ -113,22 +120,23 @@ void apply(const Ini& ini, const std::unordered_set<int>& extraGoods,
             std::vector<int> entries;
             gather_goods_entry_speffects(row, entries);
             added += add_buffs(entries, d, /*followChain*/true,
-                               /*requireSelf*/true, /*requireBuff*/true,
+                               /*applyBuffFilter*/true,
                                protectedSp, target, &skippedNonBuff);
         }
         flog("consumables: %d effect(s) (duration=%.1f), %d horse-summon skipped, "
-             "%d non-buff skipped (debuffs/system effects)",
+             "%d non-buff skipped (debuffs/enemy-targeted)",
              added, d, skippedHorse, skippedNonBuff);
     }
     if (ini.get_bool("ashes_of_war", "enabled", true)) {
         const float d = ini.get_float("ashes_of_war", "duration", -1.0f);
-        // Curated allowlist (built-in + .ini): trusted positive self-buffs, so
-        // like greases/spells they skip the self/beneficial field checks (those
-        // misread these effects) -- only the id's own finite timer is required,
-        // and system/protected effects are still excluded.
+        // Curated allowlist (built-in + .ini): a trusted id/source-curated set,
+        // so like greases it skips the debuff/target filter (which misreads
+        // these effects -- their timer row often carries no stat field) -- only
+        // the id's own finite timer is required, and system/protected effects
+        // are still excluded.
         std::vector<int> entries(ashIds.begin(), ashIds.end());
         const int added = add_buffs(entries, d, /*followChain*/false,
-                                    /*requireSelf*/false, /*requireBuff*/false,
+                                    /*applyBuffFilter*/false,
                                     protectedSp, target);
         flog("ashes_of_war: %d effect(s) (duration=%.1f) from %d allowlisted id(s)",
              added, d, static_cast<int>(ashIds.size()));

@@ -15,7 +15,8 @@ void dump_candidates(const std::unordered_set<int>& extraGoods,
                      const std::unordered_set<int>& horseGoods,
                      const std::unordered_set<int>& ashIds,
                      const std::vector<HandPair>& artPairs) {
-    flog("discover: tgt flags: S=self P=player (only self/player buffs are kept for consumables)");
+    flog("discover: tgt flags S=self P=player F=friend O=oppose/enemy; "
+         "DBF=debuff FOE=enemy-only (both dropped for consumables/spells), PROT=protected");
 
     // --- protected (horse-summon) effects -------------------
     std::unordered_set<int> protectedSp;
@@ -29,8 +30,10 @@ void dump_candidates(const std::unordered_set<int>& extraGoods,
 
     auto tgt = [](const from::paramdef::SP_EFFECT_PARAM_ST* r) {
         std::string t;
-        if (r && r->effectTargetSelf)   t += 'S';
-        if (r && r->effectTargetPlayer) t += 'P';
+        if (r && (r->effectTargetSelf   || r->effectTargetSelfTarget))      t += 'S';
+        if (r && r->effectTargetPlayer)                                     t += 'P';
+        if (r && (r->effectTargetFriend || r->effectTargetFriendlyTarget))  t += 'F';
+        if (r && (r->effectTargetEnemy  || r->effectTargetOpposeTarget))    t += 'O';
         return t.empty() ? std::string("-") : t;
     };
     auto resolved = [&](const std::vector<int>& entries, bool followChain) {
@@ -46,12 +49,13 @@ void dump_candidates(const std::unordered_set<int>& extraGoods,
             }
             for (int t : timed) {
                 auto* r = sp_row(t);
-                char buf[96];
-                // NB = non-beneficial (debuff/system effect, dropped for consumables)
-                std::snprintf(buf, sizeof(buf), "%d(dur=%.1f tgt=%s%s%s) ", t,
+                char buf[112];
+                // DBF/FOE = would be dropped by the consumable/spell filter.
+                std::snprintf(buf, sizeof(buf), "%d(dur=%.1f tgt=%s%s%s%s) ", t,
                               r ? r->effectEndurance : 0.0f, tgt(r).c_str(),
                               protectedSp.count(t) ? " PROT" : "",
-                              is_beneficial_buff(r) ? "" : " NB");
+                              is_debuff(r)   ? " DBF" : "",
+                              is_foe_only(r) ? " FOE" : "");
                 s += buf;
             }
         }
@@ -137,12 +141,15 @@ void dump_candidates(const std::unordered_set<int>& extraGoods,
     flog("discover: %d potential-miss goods (review for coverage)", mn);
 
     // --- spell buffs ----------------------------------------
-    flog("discover: ---- Magic -> SpEffect (spell-buff candidates) ----");
+    // Follows the same resolution the apply pass uses: refId as SpEffect + (for
+    // AoE self+ally buffs) refId as Bullet + behavior, then the replace/cycle
+    // chain. Entries tagged FOE/DBF would be dropped (offensive payloads/debuffs).
+    flog("discover: ---- Magic -> SpEffect (spell-buff candidates, chain-followed) ----");
     int sn = 0;
     for (auto [id, row] : from::param::Magic) {
         std::vector<int> entries;
         gather_magic_entries(row, entries);
-        std::string s = resolved(entries, false);
+        std::string s = resolved(entries, true);
         if (s == "-") continue;
         flog("magic=%d -> %s", static_cast<int>(id), s.c_str());
         ++sn;

@@ -69,11 +69,38 @@ void collect_timed_chain(int startId, std::vector<int>& out,
 
 void gather_magic_entries(const from::paramdef::MAGIC_PARAM_ST& row,
                           std::vector<int>& out) {
+    // A spell reaches its buff SpEffect the same way a goods item does, so this
+    // mirrors gather_goods_entry_speffects. Each Magic ref is (refCategoryN,
+    // refIdN): category 1 = Projectile (Bullet), 2 = SpEffect. Self-only buffs
+    // (Flame Grant Me Strength, Magic Fortification) put the buff SpEffect
+    // directly in refId (category 2) -- those already worked. Self+ally buffs
+    // (Golden Vow, Barrier of Gold, Rallying Standard, Blessing of the Erdtree)
+    // deliver the buff through an AoE Bullet (category 1): the real effect lives
+    // on that bullet's shooter/hit SpEffects, so refId alone misses it. We now
+    // follow the bullet as well, then let the caller walk the replace/cycle
+    // chain and filter (self/ally, non-debuff, timed).
     const int refs[] = {
         row.refId1, row.refId2, row.refId3, row.refId4,  row.refId5,
         row.refId6, row.refId7, row.refId8, row.refId9,  row.refId10,
     };
-    for (int r : refs) if (r >= 0) out.push_back(r);
+    const int cats[] = {
+        row.refCategory1, row.refCategory2, row.refCategory3, row.refCategory4,
+        row.refCategory5, row.refCategory6, row.refCategory7, row.refCategory8,
+        row.refCategory9, row.refCategory10,
+    };
+    for (int i = 0; i < 10; ++i) {
+        const int r = refs[i];
+        if (r < 0) continue;
+        if (sp_row(r)) out.push_back(r);                // refId as SpEffect
+        if (cats[i] == 1) add_bullet_speffects(r, out); // refId as Bullet (AoE)
+    }
+
+    if (row.behaviorId > 0) {
+        if (auto* b = behavior_row(row.behaviorId)) {
+            if (b->refType == 2 && b->refId >= 0) out.push_back(b->refId);
+            else if (b->refType == 1)             add_bullet_speffects(b->refId, out);
+        }
+    }
 }
 
 } // namespace iwb
