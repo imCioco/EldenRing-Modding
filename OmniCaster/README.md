@@ -94,12 +94,22 @@ because `PlayerGameData`'s stored “effective” block does not include every
 live correction (Godrick's Great Rune is one observed example).
 
 `requirement_swap` uses that same poll and a fourth table, `Magic`: each
-spell's original `requirementIntellect`/`requirementFaith` pair is snapshotted
-at startup, and every flip rewrites the row from that snapshot — so the
-requirement is never compounded, only moved. If you also run
-[AdjustableSpellCost](../AdjustableSpellCost), both mods edit `Magic` from
-their own threads with no ordering guarantee; the result is coherent either
-way, but the logged numbers depend on which pass ran last.
+spell's `requirementIntellect`/`requirementFaith` pair is snapshotted at
+startup, and every rewrite comes from that snapshot — so the requirement is
+never compounded, only moved.
+
+**Compatibility with [AdjustableSpellCost](../AdjustableSpellCost)**: both mods
+write those same two fields from their own threads, with no way to order each
+other. OmniCaster therefore remembers exactly what it wrote and re-checks the
+rows once a second: anything it finds there that it didn't put there (i.e.
+AdjustableSpellCost's `stat_requirements` divider) is adopted as the new
+baseline, and the swap is re-applied on top of it. Whichever mod's pass runs
+first, within a second you get the **divided** requirement, sitting on your
+**higher** casting stat. Hybrid INT+FAI spells collapse to the larger of the
+two before division, which is the same number either way. AdjustableSpellCost's
+FP costs and catalyst requirements are untouched by OmniCaster, so those always
+apply. The adoption is logged once per event (`adopted an outside edit on N
+spell row(s)`).
 
 ## Overhaul mods (Convergence, Reforged, …)
 

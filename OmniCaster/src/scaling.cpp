@@ -300,9 +300,14 @@ void highest_stat_tick(const Config& cfg) {
     if (choice_changed) {
         use_int = want_int;
         have_choice = true;
-        if (flip_catalysts)  flip_all(use_int);
-        if (flip_spell_reqs) flip_requirements(use_int);
+        if (flip_catalysts) flip_all(use_int);
     }
+
+    // Unlike the catalyst flip, this runs EVERY tick: besides applying the
+    // choice, it is what notices a sibling mod (AdjustableSpellCost) editing
+    // the same requirement fields after us, and re-baselines onto its values.
+    // It only writes rows that actually differ, so idle ticks cost nothing.
+    if (flip_spell_reqs) sync_requirements(use_int);
 
     if (choice_changed || current_stats_changed || character_changed) {
         flog("highest-stat: current INT=%d (base %d%+d) FAI=%d (base %d%+d) -> %s%s",

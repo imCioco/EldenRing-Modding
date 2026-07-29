@@ -28,3 +28,6 @@
 [submodule "InfiniteWeaponBuffs/external/Paramdex"]
 	path = InfiniteWeaponBuffs/external/Paramdex
 	url = https://github.com/soulsmods/Paramdex
+[submodule "LanternTorch/external/libER"]
+	path = LanternTorch/external/libER
+	url = https://github.com/Dasaav-dsv/libER
