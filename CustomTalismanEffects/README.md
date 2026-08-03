@@ -18,6 +18,8 @@ Press **Insert** (keyboard) or **L3 + R3** (controller) to open a Dear ImGui pan
 
 **Already-equipped talismans.** Talismans you have physically equipped are detected (by their effect being live on your character) and shown in **blue**. With stacking **off** they're also greyed out and locked — their effect is already active, so there's nothing to add. With stacking **on** they stay blue but remain toggleable. Unequip the talisman in-game and the row unlocks within about half a second.
 
+**Hide effect icons.** Many talisman effects put a status icon on the HUD next to your health bar, so enabling a dozen talismans leaves you with a permanent wall of icons that never tells you anything — the buffs don't expire. Tick **Hide effect icons (this mod's talismans only)** (or set `[overlay] hide_effect_icons = 1`) to suppress them. The scope is exactly what the label says: only effects *this mod* applied lose their icon. A talisman you have **physically equipped** keeps its icon, and no other buff — weapon grease, physick tear, Great Rune — is touched. It works by blanking `iconId` on the loaded `SpEffectParam` rows in memory and putting the original back when the mod stops applying that effect; `regulation.bin` is never modified.
+
 Changes made in the overlay are written back to `CustomTalismanEffects.ini` (on **Save to .ini** or when you close the panel), so they persist across sessions — including where you dragged the panel and how big you made it.
 
 The panel scales itself to your resolution (1440p and above get proportionally larger text and controls, 1080p keeps the authored size), so it stays readable on 4K displays. Force a specific size with `[overlay] ui_scale` if you prefer.
@@ -45,6 +47,7 @@ toggle_key           = Insert   ; key to open/close the in-game panel
 toggle_gamepad_combo = L3+R3    ; controller combo (buttons joined with +)
 ;   Available buttons: A B X Y  LB RB  L3 R3  Start Back  Up Down Left Right
 allow_stacking       = 0        ; 1 = ignore talisman families (stack anything)
+hide_effect_icons    = 0        ; 1 = hide HUD status icons for the effects this mod applies
 ui_scale             = 0.00     ; 0 = auto-scale with your resolution; or force 0.50 - 2.00
 
 [panel]

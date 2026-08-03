@@ -201,7 +201,8 @@ private:
 bool bind_swapchain_queue(IDXGISwapChain* swapchain,
                           IUnknown* device_or_queue,
                           uint64_t transaction_id,
-                          uint32_t evidence_depth) noexcept {
+                          uint32_t evidence_depth,
+                          bool replaces_ambiguous_evidence = false) noexcept {
     RetiredQueues retired{};
     size_t retired_count = 0;
     try {
@@ -276,8 +277,14 @@ bool bind_swapchain_queue(IDXGISwapChain* swapchain,
                 binding.transaction_id = transaction_id;
                 binding.evidence_depth = evidence_depth;
                 binding.last_seen_ms = now;
-                binding.proxy_ambiguous =
-                    binding.proxy_ambiguous || proxy_ambiguous;
+                // A later authoritative source (the ResizeBuffers1 queue
+                // array, DXGI queue retrieval, or an exact pointer embedded in
+                // the live swapchain) resolves an ambiguity introduced by a
+                // nested creation proxy. Ordinary creation observations remain
+                // conservative and can only add ambiguity.
+                binding.proxy_ambiguous = replaces_ambiguous_evidence
+                    ? false
+                    : binding.proxy_ambiguous || proxy_ambiguous;
                 return true;
             }
         }
@@ -292,9 +299,10 @@ bool bind_swapchain_queue(IDXGISwapChain* swapchain,
                 g_queue_bindings.erase(oldest);
             }
         }
-        pending.proxy_ambiguous = proxy_ambiguous;
+        pending.proxy_ambiguous =
+            replaces_ambiguous_evidence ? false : proxy_ambiguous;
         g_queue_bindings.push_back(std::move(pending));
-        if (proxy_ambiguous) {
+        if (proxy_ambiguous && !replaces_ambiguous_evidence) {
             flog("[overlay-v2] nested proxy used a different queue; outer swapchain is pass-through only");
         } else {
             flog("[overlay-v2] captured D3D12 queue from the innermost observed swapchain transaction");
@@ -415,7 +423,7 @@ void bind_resize_queues(IDXGISwapChain3* swapchain, UINT requested_count,
             return;
         }
         bind_swapchain_queue(swapchain, first_queue.Get(), transaction_id,
-                             evidence_depth);
+                             evidence_depth, true);
     } catch (...) {
         g_renderer_healthy.store(false, std::memory_order_release);
     }
@@ -1140,7 +1148,7 @@ void before_present_impl(IDXGISwapChain* base,
     // chain" (line present, followed by a reject reason).
     if (g_present_reached_logged_generation != call_generation) {
         g_present_reached_logged_generation = call_generation;
-        flog("[overlay-v2] shadowed Present reached the overlay for generation %llu",
+        flog("[overlay-v2] shadowed Present reached CustomTalismanEffects for generation %llu",
              static_cast<unsigned long long>(call_generation));
     }
 
@@ -1690,7 +1698,7 @@ NvapiHdrColorControlFn g_next_nvapi_hdr_color_control = nullptr;
 
 // ---- late-adoption state (see the adoption section further down) ----
 //
-// A loader can inject this mod after the game already created its swapchain
+// A loader can inject CustomTalismanEffects after the game already created its swapchain
 // (Elden Mod Loader delays, manual injectors). The creation detours then never
 // run, and without this fallback the canvas could never validate. Adoption
 // watches live Present calls through pass-through observer hooks and installs
@@ -1708,7 +1716,7 @@ Present1Fn g_next_present1_observed = nullptr;
 ExecuteCommandListsFn g_next_execute_command_lists = nullptr;
 
 enum class AdoptionState : uint32_t {
-    Idle = 0,     // never armed; zero overhead on the normal creation path
+    Idle = 0,     // resident observers; collect only until creation succeeds
     Pending,      // observers active, waiting for a candidate + queue evidence
     Adopted,      // a live swapchain was shadowed and bound
     Failed,       // permanently ambiguous or unprovable; stay pass-through
@@ -1716,6 +1724,7 @@ enum class AdoptionState : uint32_t {
 std::atomic<uint32_t> g_adoption_state{
     static_cast<uint32_t>(AdoptionState::Idle)};
 bool g_adoption_hooks_installed = false; // overlay/control thread only
+bool g_adoption_hook_install_failed = false;
 
 // The probe swapchain used to resolve vtable code pointers must never be
 // shadowed, bound, or counted as a game creation.
@@ -1730,11 +1739,6 @@ std::atomic<uint32_t> g_creation_detour_calls{0};
 // it, a visible game window is mistaken for a late load.
 std::atomic<bool> g_observed_creation{false};
 
-// This mod intercepts DXGI creation via factory vtable slots (see
-// install_factory_slot); the code-patch targets are the fallback.  Forensics
-// inspects whichever was actually used.
-void** g_forensics_create_swapchain_slot = nullptr;
-void** g_forensics_create_swapchain_for_hwnd_slot = nullptr;
 void* g_forensics_create_swapchain_target = nullptr;
 void* g_forensics_create_swapchain_for_hwnd_target = nullptr;
 
@@ -1854,52 +1858,7 @@ struct HookTargets {
     void* create_swapchain_for_hwnd = nullptr;
     void* nvapi_get_display_id_by_name = nullptr;
     void* nvapi_hdr_color_control = nullptr;
-    // The factory's shared vtable, for slot interception (see
-    // install_factory_slot). Null falls back to code patching.
-    void** factory_vtable = nullptr;
 };
-
-// ── DXGI creation interception: vtable slot, not code patch ──
-// DEVIATION FROM QUESTPATH, and the reason this mod's overlay works while
-// QuestPath is loaded. QuestPath MinHook-patches the first five bytes of
-// dxgi!CreateSwapChain(ForHwnd). Two injected DLLs each running their own
-// MinHook cannot do that concurrently: MH_CreateHook snapshots the target's
-// bytes to build its trampoline, so when both create before either applies,
-// both trampolines hold the ORIGINAL bytes and the second MH_ApplyQueued
-// simply overwrites the first mod's JMP -- the loser's detour is silently
-// orphaned for the rest of the session (observed 2026-07-19: both mods logged
-// "hooks installed" in the same millisecond; only QuestPath ever saw a
-// creation). MinHook chains correctly ONLY if the second create happens after
-// the first patch is already live, which nothing serializes.
-//
-// A factory vtable slot is a different layer, so it cannot collide with a code
-// patch in either load order. All DXGI factory instances of dxgi.dll's factory
-// class share this vtable, so replacing the slot intercepts the game's factory
-// too, and the previous slot value stays our immediate-next:
-//
-//   game -> our detour -> dxgi!CreateSwapChainForHwnd (QuestPath's JMP, if it
-//           patched) -> QuestPath's detour -> its trampoline -> real function
-//
-// Both mods observe every creation, whichever loaded first. A single aligned
-// pointer store is atomic on x64, so a concurrent caller reads either the old
-// or the new slot -- never a torn pointer.
-bool install_factory_slot(void** vtable, size_t index, void* detour,
-                          void** next_out) noexcept {
-    if (!vtable || !detour || !next_out) return false;
-    void** slot = vtable + index;
-    DWORD previous_protection = 0;
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE,
-                        &previous_protection))
-        return false;
-    // Capture whatever is there now -- possibly another tool's detour, which
-    // must keep running as our immediate-next.
-    *next_out = *slot;
-    *slot = detour;
-    DWORD restored = 0;
-    VirtualProtect(slot, sizeof(void*), previous_protection, &restored);
-    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void*));
-    return *next_out != nullptr;
-}
 
 bool is_elden_ring_process() noexcept {
     wchar_t path[MAX_PATH]{};
@@ -1917,7 +1876,7 @@ bool is_elden_ring_process() noexcept {
 //
 // The creation detours are the authoritative discovery and queue-association
 // path, but they can only ever observe creations that happen after they are
-// installed. When this mod is loaded late the game's swapchain (and its
+// installed. When CustomTalismanEffects is loaded late the game's swapchain (and its
 // direct command queue) already exist. Adoption recovers from that with the
 // backend's evidence rules intact:
 //
@@ -1930,6 +1889,9 @@ bool is_elden_ring_process() noexcept {
 //    (GetDevice(ID3D12CommandQueue)); measured on Windows 11 23H2 this
 //    returns E_NOINTERFACE, but the call is exact if any DXGI build honors
 //    it, so it stays as the first choice.
+//  * Next, the hudhook-compatible layout probe accepts an observed direct
+//    queue only when that exact interface pointer is uniquely embedded in the
+//    live swapchain object. This remains authoritative with multiple queues.
 //  * Otherwise an ELDEN-RING-SPECIFIC correlation adapter may promote the
 //    device's single active direct queue: presentation requires a direct
 //    queue on the swapchain's device, so when exactly one direct queue has
@@ -1941,7 +1903,7 @@ bool is_elden_ring_process() noexcept {
 //    never promote correlation evidence and simply stay pass-through.
 //
 // Color for an adopted chain cannot use the creation-default rule (the game
-// may have called SetColorSpace1 before this mod loaded), so arming issues
+// may have called SetColorSpace1 before CustomTalismanEffects loaded), so arming issues
 // one direct NVAPI GET to seed the existing vendor color observations. On
 // systems without NVAPI, R10/FP16 adopted chains keep failing closed exactly
 // like a detected wrapper does today.
@@ -1958,7 +1920,10 @@ struct AdoptionQueueEvidence {
     ID3D12CommandQueue* queue = nullptr; // AddRef'd; retained for process life
     std::atomic<uint32_t> calls{0};
 };
-constexpr size_t kMaximumAdoptionQueues = 8;
+// Injected renderers commonly create their own direct queues during bootstrap.
+// Keep enough evidence slots to reach the game's queue even in a busy overlay
+// stack; the array is fixed and each entry is retained for process life.
+constexpr size_t kMaximumAdoptionQueues = 32;
 AdoptionQueueEvidence g_adoption_queues[kMaximumAdoptionQueues];
 std::atomic<uint32_t> g_adoption_queue_count{0};
 std::atomic<bool> g_adoption_queue_overflow{false};
@@ -2010,14 +1975,18 @@ AdoptionQueueEvidence* record_adoption_queue(
         } else {
             ComPtr<ID3D12Device> device;
             if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) && device) {
-                AdoptionQueueEvidence& slot = g_adoption_queues[count];
-                slot.device_identity = com_identity(device.Get());
-                slot.queue = queue;
-                queue->AddRef();
-                slot.queue_identity.store(identity, std::memory_order_release);
-                g_adoption_queue_count.store(count + 1,
-                                             std::memory_order_release);
-                result = &slot;
+                void* const device_identity = com_identity(device.Get());
+                if (device_identity) {
+                    AdoptionQueueEvidence& slot = g_adoption_queues[count];
+                    slot.device_identity = device_identity;
+                    slot.queue = queue;
+                    queue->AddRef();
+                    slot.queue_identity.store(identity,
+                                              std::memory_order_release);
+                    g_adoption_queue_count.store(count + 1,
+                                                 std::memory_order_release);
+                    result = &slot;
+                }
             }
         }
     }
@@ -2025,10 +1994,113 @@ AdoptionQueueEvidence* record_adoption_queue(
     return result;
 }
 
+// hudhook's DX12 fallback does one thing CustomTalismanEffects's original late-adoption
+// adapter did not: it verifies a candidate queue by finding that exact
+// interface pointer in the live swapchain object's private storage. This is
+// stronger than choosing the first/last queue observed globally and remains
+// useful when a wrapper creates multiple direct queues on the same device.
+//
+// The DXGI layout is private, so the scan is deliberately evidence-only: it
+// reads at most the same 512 pointer slots as hudhook, never dereferences a
+// discovered value, and accepts a result only when exactly one already
+// validated direct queue for this D3D12 device is present. Any unreadable page
+// or multiple embedded queues fails closed into the existing correlation path.
+constexpr size_t kEmbeddedQueueProbeSlots = 512;
+
+bool readable_queue_probe_protection(DWORD protection) noexcept {
+    if ((protection & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    switch (protection & 0xFFu) {
+    case PAGE_READONLY:
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:
+    case PAGE_EXECUTE_READ:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    default:
+        return false;
+    }
+}
+
+size_t readable_queue_probe_slots(const void* object) noexcept {
+    if (!object) return 0;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(object);
+    const uintptr_t requested_end =
+        begin + kEmbeddedQueueProbeSlots * sizeof(void*);
+    if (requested_end < begin) return 0;
+
+    uintptr_t cursor = begin;
+    while (cursor < requested_end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info,
+                         sizeof(info)) != sizeof(info) ||
+            info.State != MEM_COMMIT ||
+            !readable_queue_probe_protection(info.Protect))
+            break;
+
+        const uintptr_t region_begin =
+            reinterpret_cast<uintptr_t>(info.BaseAddress);
+        const uintptr_t region_end = region_begin + info.RegionSize;
+        if (region_end <= cursor || region_end < region_begin) break;
+        cursor = std::min(region_end, requested_end);
+    }
+    return static_cast<size_t>((cursor - begin) / sizeof(void*));
+}
+
+struct EmbeddedQueueProbe {
+    AdoptionQueueEvidence* match = nullptr;
+    size_t byte_offset = 0;
+    size_t readable_slots = 0;
+    bool ambiguous = false;
+};
+
+EmbeddedQueueProbe probe_embedded_swapchain_queue(
+    IDXGISwapChain* swapchain, void* device_identity) noexcept {
+    EmbeddedQueueProbe result{};
+    if (!swapchain || !device_identity) return result;
+    result.readable_slots = readable_queue_probe_slots(swapchain);
+    if (result.readable_slots == 0) return result;
+
+    const uint32_t published =
+        g_adoption_queue_count.load(std::memory_order_acquire);
+    void* const* const fields = reinterpret_cast<void* const*>(swapchain);
+    __try {
+        for (size_t field = 0; field < result.readable_slots; ++field) {
+            void* const value = fields[field];
+            for (uint32_t index = 0; index < published; ++index) {
+                AdoptionQueueEvidence& candidate = g_adoption_queues[index];
+                if (candidate.device_identity != device_identity ||
+                    !candidate.queue || candidate.queue != value ||
+                    !candidate.queue_identity.load(std::memory_order_acquire))
+                    continue;
+
+                if (!result.match) {
+                    result.match = &candidate;
+                    result.byte_offset = field * sizeof(void*);
+                } else if (result.match != &candidate) {
+                    result.ambiguous = true;
+                    return result;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // The private object can disappear only under invalid concurrent host
+        // lifetime behavior. Treat the probe as absent and preserve Present.
+        result = {};
+    }
+    return result;
+}
+
 void STDMETHODCALLTYPE execute_command_lists_observer(
     ID3D12CommandQueue* queue, UINT count,
     ID3D12CommandList* const* lists) {
-    if (adoption_state() == AdoptionState::Pending && queue) {
+    const AdoptionState state = adoption_state();
+    const bool collect_for_possible_adoption =
+        !g_stopping.load(std::memory_order_acquire) &&
+        (state == AdoptionState::Pending ||
+         (state == AdoptionState::Idle &&
+          !g_observed_creation.load(std::memory_order_acquire)));
+    if (collect_for_possible_adoption && queue) {
         if (queue != g_tls_ecl_cached_pointer) {
             g_tls_ecl_cached_pointer = queue;
             g_tls_ecl_cached_slot = record_adoption_queue(queue);
@@ -2067,10 +2139,17 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
             if (adoption_state() != AdoptionState::Pending ||
                 g_stopping.load(std::memory_order_acquire))
                 break;
-            // Chains shadowed by the creation path (or a prior adoption) need
-            // nothing further; this also makes the shadow's own downstream
-            // Present call a no-op here.
-            if (dxgi_shadow::generation_token(swapchain) != 0) break;
+            // A creation wrapper can let CustomTalismanEffects shadow the returned object
+            // while preventing an authoritative queue binding (for example,
+            // nested proxy layers that expose different queues). The previous
+            // adoption path rejected every already-shadowed object, making
+            // that otherwise recoverable state permanent. Keep eligible
+            // shadows and repair only their missing/ambiguous queue evidence.
+            const uint64_t existing_generation =
+                dxgi_shadow::generation_token(swapchain);
+            if (existing_generation != 0 &&
+                !dxgi_shadow::renderer_eligible(swapchain))
+                break;
             if (!eligible_shadow_candidate(swapchain)) break;
 
             AdoptionCandidate& candidate = g_adoption_candidate;
@@ -2098,15 +2177,9 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
             ComPtr<ID3D12CommandQueue> queue;
             if (FAILED(swapchain->GetDevice(IID_PPV_ARGS(&queue))))
                 queue.Reset();
-            bool correlated = false;
+            const char* queue_evidence =
+                "DXGI GetDevice(ID3D12CommandQueue)";
             if (!queue) {
-                if (!is_elden_ring_process()) {
-                    adoption_failed_locked(
-                        "DXGI does not expose the creation queue and the "
-                        "single-queue correlation adapter is Elden Ring "
-                        "specific");
-                    break;
-                }
                 if (g_adoption_queue_overflow.load(std::memory_order_acquire)) {
                     adoption_failed_locked(
                         "too many distinct direct command queues to reason "
@@ -2118,31 +2191,68 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
                     !device)
                     break;
                 void* const device_identity = com_identity(device.Get());
+                if (!device_identity) break;
+
+                // Match hudhook's strongest late-injection evidence before
+                // applying CustomTalismanEffects's game-specific single-queue rule. This
+                // remains exact even when another overlay/proxy has introduced
+                // multiple direct queues on the same device.
+                const EmbeddedQueueProbe embedded =
+                    probe_embedded_swapchain_queue(swapchain,
+                                                   device_identity);
+                if (embedded.ambiguous) {
+                    adoption_failed_locked(
+                        "multiple observed command queues are embedded in the "
+                        "live swapchain");
+                    break;
+                }
+                if (embedded.match) {
+                    queue = embedded.match->queue;
+                    queue_evidence =
+                        "exact queue pointer embedded in live swapchain";
+                    flog("[overlay-v2] adoption: matched the presentation "
+                         "queue at swapchain offset +0x%zX (%zu readable "
+                         "pointer slots)",
+                         embedded.byte_offset, embedded.readable_slots);
+                }
+
+                if (!queue && !is_elden_ring_process()) {
+                    adoption_failed_locked(
+                        "DXGI does not expose the creation queue, no observed "
+                        "queue pointer is embedded in the swapchain, and the "
+                        "single-queue correlation adapter is Elden Ring "
+                        "specific");
+                    break;
+                }
+
                 AdoptionQueueEvidence* match = nullptr;
                 bool ambiguous = false;
-                const uint32_t published =
-                    g_adoption_queue_count.load(std::memory_order_acquire);
-                for (uint32_t index = 0; index < published; ++index) {
-                    AdoptionQueueEvidence& slot = g_adoption_queues[index];
-                    if (!slot.queue_identity.load(std::memory_order_acquire) ||
-                        slot.device_identity != device_identity)
-                        continue;
-                    if (match) {
-                        ambiguous = true;
-                        break;
+                if (!queue) {
+                    const uint32_t published =
+                        g_adoption_queue_count.load(std::memory_order_acquire);
+                    for (uint32_t index = 0; index < published; ++index) {
+                        AdoptionQueueEvidence& slot = g_adoption_queues[index];
+                        if (!slot.queue_identity.load(
+                                std::memory_order_acquire) ||
+                            slot.device_identity != device_identity)
+                            continue;
+                        if (match) {
+                            ambiguous = true;
+                            break;
+                        }
+                        match = &slot;
                     }
-                    match = &slot;
                 }
                 if (ambiguous) {
                     adoption_failed_locked(
                         "multiple direct command queues are active on the "
-                        "game device; the overlay cannot prove which one "
+                        "game device; CustomTalismanEffects cannot prove which one "
                         "presents");
                     break;
                 }
-                if (!match ||
-                    match->calls.load(std::memory_order_relaxed) <
-                        kAdoptionMinimumQueueCalls) {
+                if (!queue &&
+                    (!match || match->calls.load(std::memory_order_relaxed) <
+                                   kAdoptionMinimumQueueCalls)) {
                     if (!candidate.waiting_logged) {
                         candidate.waiting_logged = true;
                         flog("[overlay-v2] adoption: waiting for sustained "
@@ -2152,7 +2262,7 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
                 }
                 // The presenting thread's own last direct submit must not
                 // contradict the single-queue conclusion.
-                if (g_tls_last_direct_queue_identity &&
+                if (!queue && g_tls_last_direct_queue_identity &&
                     g_tls_last_direct_queue_identity !=
                         match->queue_identity.load(std::memory_order_acquire)) {
                     adoption_failed_locked(
@@ -2160,13 +2270,17 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
                         "queue than the only observed one");
                     break;
                 }
-                queue = match->queue;
-                correlated = true;
+                if (!queue) {
+                    queue = match->queue;
+                    queue_evidence =
+                        "single active direct queue, Elden Ring adapter";
+                }
             }
             if (!queue) break;
 
             BindingScope binding_scope(g_creation_transaction);
-            if (!install_swapchain_shadow(swapchain)) {
+            if (existing_generation == 0 &&
+                !install_swapchain_shadow(swapchain)) {
                 if (++candidate.install_attempts >=
                     kAdoptionMaximumInstallAttempts)
                     adoption_failed_locked(
@@ -2175,17 +2289,16 @@ void try_adopt_swapchain(IDXGISwapChain* swapchain) noexcept {
                 break;
             }
             if (!bind_swapchain_queue(swapchain, queue.Get(),
-                                      binding_scope.id(),
-                                      binding_scope.depth())) {
+                                       binding_scope.id(),
+                                       binding_scope.depth(), true)) {
                 adoption_failed_locked(
                     "the recovered queue failed exact-identity validation");
                 break;
             }
             set_adoption_state(AdoptionState::Adopted);
             flog("[overlay-v2] adopted the live game swapchain (queue "
-                 "evidence: %s)",
-                 correlated ? "single active direct queue, Elden Ring adapter"
-                            : "recovered from the swapchain itself");
+                  "evidence: %s)",
+                  queue_evidence);
         } while (false);
     } catch (...) {
         // Adoption is strictly optional; never let it disturb the host call.
@@ -2217,9 +2330,7 @@ HRESULT STDMETHODCALLTYPE present1_observer_detour(
 // submitted, and everything is released before the observer hooks install, so
 // the probe can never be seen (or adopted) by the observers. The window is a
 // 64x64 tool window, which additionally fails both valid_creation_window and
-// the minimum-canvas gates.  Because this mod intercepts CreateSwapChainForHwnd
-// through the factory vtable slot, the probe's own creation dispatches into our
-// detour; g_adoption_probe_in_progress makes that a pass-through no-op.
+// the minimum-canvas gates.
 bool resolve_adoption_targets(void** present_target, void** present1_target,
                               void** execute_target) noexcept {
     g_adoption_probe_in_progress = true;
@@ -2245,15 +2356,16 @@ bool resolve_adoption_targets(void** present_target, void** present1_target,
 
         WNDCLASSW window_class{};
         window_class.lpfnWndProc = DefWindowProcW;
-        // The class belongs to this DLL, not the executable. Its per-mod name
-        // prevents two delayed backend copies from racing on registration
-        // before either one reaches the shared hook-install mutex.
+        // The class is PRIVATE to this backend copy. Using the DLL HINSTANCE
+        // and its QP_BACKEND_MOD_ID-derived name prevents two delayed mods
+        // from racing on one hard-coded process-wide class before hook-install
+        // arbitration begins.
         window_class.hInstance = g_hinst;
         window_class.lpszClassName = kProbeClass;
         class_registered = RegisterClassW(&window_class) != 0;
         if (!class_registered) {
-            flog("[overlay-v2] [ERROR] adoption probe class registration "
-                 "failed (err %lu)", GetLastError());
+            flog("[overlay-v2] [ERROR] adoption probe window-class "
+                 "registration failed (err %lu)", GetLastError());
             break;
         }
         hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kProbeClass, L"",
@@ -2300,7 +2412,7 @@ bool resolve_adoption_targets(void** present_target, void** present1_target,
 }
 
 // One direct NVAPI GET so an adopted R10/FP16 chain can prove its current
-// encoding; the game's own HDR SETs happened before this mod loaded. Calls
+// encoding; the game's own HDR SETs happened before CustomTalismanEffects loaded. Calls
 // nvapi64 directly (never through the game's hooked wrappers). Absence of
 // NVAPI (AMD/Intel) is not an error: those chains keep failing closed.
 void query_nvapi_current_hdr(HWND game_window) noexcept {
@@ -2352,7 +2464,7 @@ void query_nvapi_current_hdr(HWND game_window) noexcept {
     try {
         record_nvapi_display_binding(output_name, display_id);
         record_nvapi_color_observation(display_id, header->hdr_mode,
-                                       "the overlay's direct query");
+                                       "CustomTalismanEffects's direct query");
     } catch (...) {
         // Optional evidence only.
     }
@@ -2443,7 +2555,6 @@ bool resolve_hook_targets(HookTargets& targets) {
     // probe HWND, D3D device, command queue, or private swapchain.
     void** vtable = *reinterpret_cast<void***>(factory.Get());
     if (!vtable) return false;
-    targets.factory_vtable = vtable;
     targets.create_swapchain = vtable[10];
     targets.create_swapchain_for_hwnd = vtable[15];
     resolve_nvapi_hook_targets(targets);
@@ -2461,47 +2572,23 @@ bool queue_hook(void* target, void* detour, Fn& next, const char* name) {
 }
 
 bool install_all_hooks(const HookTargets& target) {
-    bool ok = true;
-    // The MinHook portion of this batch (the NVAPI observer, plus the DXGI
-    // code-patch fallback below) is one create->apply transaction and MUST be
-    // serialized against any other mod embedding this backend. An interleaved
-    // install erases one side's jmp with every call still returning MH_OK --
-    // see hooks.hpp. The vtable-slot interception is a different layer and
-    // needs no lock, but taking it here covers the whole function uniformly.
+    // The whole batch is one create->apply transaction and MUST be serialized
+    // against any other mod embedding this backend. An interleaved install
+    // erases one side's jmp with every call still returning MH_OK. Resident
+    // observers can now recover many such misses, but only the creation call
+    // carries API-defined queue evidence, so preserving both hooks remains the
+    // preferred and most compatible path. See hooks.hpp for the interleaving.
     hooks::InstallLock install_lock;
-
-    // Slot interception first (see install_factory_slot for why). Code patching
-    // remains the fallback for the case where the vtable page cannot be made
-    // writable, which is also the only configuration that can still lose a
-    // create/apply race against another MinHook user.
-    const bool slots_installed =
-        target.factory_vtable &&
-        install_factory_slot(target.factory_vtable, 10,
-                             reinterpret_cast<void*>(&create_swapchain_detour),
-                             reinterpret_cast<void**>(&g_next_create_swapchain)) &&
-        install_factory_slot(target.factory_vtable, 15,
-                             reinterpret_cast<void*>(&create_swapchain_for_hwnd_detour),
-                             reinterpret_cast<void**>(&g_next_create_swapchain_for_hwnd));
-    if (slots_installed) {
-        flog("[overlay-v2] DXGI creation intercepted via factory vtable slots "
-             "(coexists with code-patching overlays)");
-        // Forensics inspects the slots we actually replaced, not the (still
-        // pristine) code prologue -- see log_creation_hook_forensics.
-        g_forensics_create_swapchain_slot = target.factory_vtable + 10;
-        g_forensics_create_swapchain_for_hwnd_slot = target.factory_vtable + 15;
-    } else {
-        flog("[overlay-v2] [WARN] factory vtable interception unavailable; "
-             "falling back to code patching");
-        ok &= queue_hook(target.create_swapchain,
-                         reinterpret_cast<void*>(&create_swapchain_detour),
-                         g_next_create_swapchain, "CreateSwapChain");
-        ok &= queue_hook(target.create_swapchain_for_hwnd,
-                         reinterpret_cast<void*>(&create_swapchain_for_hwnd_detour),
-                         g_next_create_swapchain_for_hwnd, "CreateSwapChainForHwnd");
-        g_forensics_create_swapchain_target = target.create_swapchain;
-        g_forensics_create_swapchain_for_hwnd_target =
-            target.create_swapchain_for_hwnd;
-    }
+    bool ok = true;
+    ok &= queue_hook(target.create_swapchain,
+                     reinterpret_cast<void*>(&create_swapchain_detour),
+                     g_next_create_swapchain, "CreateSwapChain");
+    ok &= queue_hook(target.create_swapchain_for_hwnd,
+                     reinterpret_cast<void*>(&create_swapchain_for_hwnd_detour),
+                     g_next_create_swapchain_for_hwnd, "CreateSwapChainForHwnd");
+    g_forensics_create_swapchain_target = target.create_swapchain;
+    g_forensics_create_swapchain_for_hwnd_target =
+        target.create_swapchain_for_hwnd;
 
     bool nvapi_targets_present = false;
     bool nvapi_observer_ready = false;
@@ -2543,6 +2630,40 @@ bool install_all_hooks(const HookTargets& target) {
     return true;
 }
 
+bool install_adoption_observer_hooks(void* present_target,
+                                     void* present1_target,
+                                     void* execute_target) {
+    if (g_adoption_hooks_installed) return true;
+    if (g_adoption_hook_install_failed) return false;
+
+    // hudhook installs the shared Present and ExecuteCommandLists hooks during
+    // bootstrap. Keeping CustomTalismanEffects's equivalents resident from the same early
+    // point avoids hot-patching a mature multi-overlay chain ten seconds into
+    // gameplay. They are observers only: normal rendering remains on the
+    // per-instance vtable shadow, and Idle is a pass-through atomic check.
+    hooks::InstallLock install_lock;
+    bool ok = true;
+    ok &= queue_hook(present_target,
+                     reinterpret_cast<void*>(&present_observer_detour),
+                     g_next_present_observed, "Present observer");
+    ok &= queue_hook(present1_target,
+                     reinterpret_cast<void*>(&present1_observer_detour),
+                     g_next_present1_observed, "Present1 observer");
+    ok &= queue_hook(
+        execute_target,
+        reinterpret_cast<void*>(&execute_command_lists_observer),
+        g_next_execute_command_lists, "ExecuteCommandLists observer");
+    const bool applied = hooks::apply();
+    if (!ok || !applied) {
+        // Some links may already be active. Idle keeps them exact
+        // pass-through; never retry an uncertain partial MinHook transaction.
+        g_adoption_hook_install_failed = true;
+        return false;
+    }
+    g_adoption_hooks_installed = true;
+    return true;
+}
+
 // -------------------------------------------------------------------------
 // Creation-hook forensics
 
@@ -2564,7 +2685,7 @@ bool safe_read_bytes(const void* source, void* destination,
 // a VirtualAlloc'd relay page, which then does `jmp qword ptr [rip+0]` to the
 // real detour.  That page belongs to no module, so naively reporting the rel32
 // destination accuses a peer mod of overwriting a hook that is in fact intact
-// -- and which loader placed this DLL near dxgi.dll decides whether it
+// -- and which loader placed CustomTalismanEffects.dll near dxgi.dll decides whether it
 // happens at all.  Follow the chain a couple of hops before concluding
 // anything.
 const void* follow_jump_chain(const void* destination) noexcept {
@@ -2607,12 +2728,11 @@ void log_patch_owner(const char* name, const char* patch_kind,
         }
     }
     flog("[overlay-v2] forensics: %s prologue is a %s into %ls at %p -- "
-         "a mod that hooked after this one (legitimate if it chains back) "
-         "or one that overwrote this mod's hook",
+         "a mod that hooked after CustomTalismanEffects (legitimate if it chains back) "
+         "or one that overwrote CustomTalismanEffects's hook",
          name, patch_kind, base_name, destination);
 }
 
-// Code-patch mode (fallback): inspect the dxgi entrypoint's prologue.
 void log_creation_target_forensics(const char* name, void* target,
                                    const void* detour) noexcept {
     if (!target) return;
@@ -2629,14 +2749,14 @@ void log_creation_target_forensics(const char* name, void* target,
         const void* destination = code + 5 + displacement;
         if (destination != detour && follow_jump_chain(destination) == detour) {
             flog("[overlay-v2] forensics: %s patch is intact (through "
-                 "MinHook's relay at %p) -- the chain still enters this "
-                 "mod's detour",
+                 "MinHook's relay at %p) -- the chain still enters "
+                 "CustomTalismanEffects's detour",
                  name, destination);
             return;
         }
         if (destination == detour) {
             flog("[overlay-v2] forensics: %s patch is intact -- the jump "
-                 "still enters this mod's detour",
+                 "still enters CustomTalismanEffects's detour",
                  name);
         } else {
             log_patch_owner(name, "relative jump", destination);
@@ -2652,7 +2772,7 @@ void log_creation_target_forensics(const char* name, void* target,
             if (destination == detour ||
                 follow_jump_chain(destination) == detour)
                 flog("[overlay-v2] forensics: %s patch is intact -- the "
-                     "indirect jump still enters this mod's detour",
+                     "indirect jump still enters CustomTalismanEffects's detour",
                      name);
             else
                 log_patch_owner(name, "absolute indirect jump", destination);
@@ -2662,36 +2782,9 @@ void log_creation_target_forensics(const char* name, void* target,
         return;
     }
     flog("[overlay-v2] forensics: %s prologue bytes %02X %02X %02X %02X "
-         "%02X are not a recognized detour patch -- this mod's hook was "
+         "%02X are not a recognized detour patch -- CustomTalismanEffects's hook was "
          "overwritten or removed",
          name, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]);
-}
-
-// Slot mode (default for this mod): inspect the factory vtable entry we
-// replaced.  A slot that no longer points at our detour was taken by another
-// tool -- legitimate if that tool captured our pointer as its immediate-next.
-void log_creation_slot_forensics(const char* name, void** slot,
-                                 const void* detour) noexcept {
-    if (!slot) return;
-    void* current = nullptr;
-    if (!safe_read_bytes(slot, &current, sizeof(current))) {
-        flog("[overlay-v2] forensics: %s vtable slot %p is unreadable", name,
-             static_cast<void*>(slot));
-        return;
-    }
-    if (current == detour) {
-        flog("[overlay-v2] forensics: %s factory vtable slot still points at "
-             "this mod's detour (intact)",
-             name);
-        return;
-    }
-    if (follow_jump_chain(current) == detour) {
-        flog("[overlay-v2] forensics: %s factory vtable slot chains back to "
-             "this mod's detour (intact)",
-             name);
-        return;
-    }
-    log_patch_owner(name, "factory vtable slot", current);
 }
 
 } // namespace
@@ -2721,6 +2814,15 @@ bool install_hooks() {
         flog("[overlay-v2] [ERROR] DXGI/D3D12 hook target discovery failed");
         return false;
     }
+    // Resolve the standard shared method addresses before CustomTalismanEffects publishes
+    // any creation detour or per-instance shadow. This mirrors hudhook's dummy
+    // device/swapchain bootstrap and prevents our own hooks from contaminating
+    // the compatibility probe.
+    void* present_target = nullptr;
+    void* present1_target = nullptr;
+    void* execute_target = nullptr;
+    const bool observer_targets_resolved = resolve_adoption_targets(
+        &present_target, &present1_target, &execute_target);
     dxgi_shadow::Callbacks callbacks{};
     callbacks.before_present = &shadow_before_present;
     callbacks.after_present = &shadow_after_present;
@@ -2738,8 +2840,22 @@ bool install_hooks() {
         return false;
     }
 
+    if (observer_targets_resolved) {
+        if (install_adoption_observer_hooks(present_target, present1_target,
+                                            execute_target)) {
+            flog("[overlay-v2] resident Present/ExecuteCommandLists compatibility observers installed");
+        } else {
+            flog("[overlay-v2] [WARN] compatibility observer hook transaction failed; creation-path rendering remains active");
+        }
+    } else {
+        // Creation interception is still authoritative. A later arm_adoption()
+        // retries the probe in case device creation was only transiently
+        // unavailable during bootstrap.
+        flog("[overlay-v2] [WARN] compatibility observer probe unavailable at bootstrap; creation-path rendering remains active");
+    }
+
     g_installed.store(true, std::memory_order_release);
-    flog("[overlay-v2] DXGI creation hooks installed; Present uses per-instance shadows");
+    flog("[overlay-v2] DXGI creation hooks installed; rendering uses per-instance Present shadows");
 
     // Queue discovery is the only part that cannot be recovered after the
     // game creates its swapchain, so hooks go live before shader compilation.
@@ -2768,28 +2884,15 @@ void log_creation_hook_forensics() {
         flog("[overlay-v2] forensics: creation hooks were never installed");
         return;
     }
-    flog("[overlay-v2] forensics: this mod's DXGI creation detours have run "
+    flog("[overlay-v2] forensics: CustomTalismanEffects's DXGI creation detours have run "
          "%u time(s) since load",
          g_creation_detour_calls.load(std::memory_order_relaxed));
-    if (g_forensics_create_swapchain_slot ||
-        g_forensics_create_swapchain_for_hwnd_slot) {
-        // Default path: interception is via factory vtable slots.
-        log_creation_slot_forensics(
-            "CreateSwapChain", g_forensics_create_swapchain_slot,
-            reinterpret_cast<const void*>(&create_swapchain_detour));
-        log_creation_slot_forensics(
-            "CreateSwapChainForHwnd", g_forensics_create_swapchain_for_hwnd_slot,
-            reinterpret_cast<const void*>(&create_swapchain_for_hwnd_detour));
-    } else {
-        // Fallback path: interception is a code patch on the dxgi entrypoint.
-        log_creation_target_forensics(
-            "CreateSwapChain", g_forensics_create_swapchain_target,
-            reinterpret_cast<const void*>(&create_swapchain_detour));
-        log_creation_target_forensics(
-            "CreateSwapChainForHwnd",
-            g_forensics_create_swapchain_for_hwnd_target,
-            reinterpret_cast<const void*>(&create_swapchain_for_hwnd_detour));
-    }
+    log_creation_target_forensics(
+        "CreateSwapChain", g_forensics_create_swapchain_target,
+        reinterpret_cast<const void*>(&create_swapchain_detour));
+    log_creation_target_forensics(
+        "CreateSwapChainForHwnd", g_forensics_create_swapchain_for_hwnd_target,
+        reinterpret_cast<const void*>(&create_swapchain_for_hwnd_detour));
 }
 
 void arm_adoption(HWND game_window_hint) {
@@ -2801,15 +2904,21 @@ void arm_adoption(HWND game_window_hint) {
     if (adoption_state() == AdoptionState::Pending) return;
 
     if (g_adoption_hooks_installed) {
-        // Re-arm: the observers are resident; only the search state resets.
-        // Covers a replacement swapchain being missed while the creation hook
-        // is dead (the same condition that required adoption initially).
+        // Arm/re-arm: the observers are resident from bootstrap; only the
+        // search state changes. This also covers a replacement swapchain being
+        // missed while the creation hook is dead.
         AcquireSRWLockExclusive(&g_adoption_try_lock);
         g_adoption_candidate = {};
         ReleaseSRWLockExclusive(&g_adoption_try_lock);
         set_adoption_state(AdoptionState::Pending);
         query_nvapi_current_hdr(game_window_hint); // HDR may have changed
-        flog("[overlay-v2] swapchain adoption re-armed");
+        flog("[overlay-v2] swapchain adoption armed using resident observers");
+        return;
+    }
+    if (g_adoption_hook_install_failed) {
+        set_adoption_state(AdoptionState::Failed);
+        flog("[overlay-v2] [ERROR] compatibility observer installation was "
+             "previously incomplete; late adoption unavailable");
         return;
     }
 
@@ -2824,31 +2933,13 @@ void arm_adoption(HWND game_window_hint) {
              "unavailable");
         return;
     }
-    {
-        // Same serialization contract as every other hook batch (hooks.hpp).
-        hooks::InstallLock install_lock;
-        bool ok = true;
-        ok &= queue_hook(present_target,
-                         reinterpret_cast<void*>(&present_observer_detour),
-                         g_next_present_observed, "Present observer");
-        ok &= queue_hook(present1_target,
-                         reinterpret_cast<void*>(&present1_observer_detour),
-                         g_next_present1_observed, "Present1 observer");
-        ok &= queue_hook(
-            execute_target,
-            reinterpret_cast<void*>(&execute_command_lists_observer),
-            g_next_execute_command_lists, "ExecuteCommandLists observer");
-        ok &= hooks::apply();
-        if (!ok) {
-            // Partial installs stay resident as pass-through; adoption never
-            // activates them, mirroring the creation-batch failure policy.
-            set_adoption_state(AdoptionState::Failed);
-            flog("[overlay-v2] [ERROR] adoption hook transaction failed; "
-                 "late adoption unavailable");
-            return;
-        }
+    if (!install_adoption_observer_hooks(
+            present_target, present1_target, execute_target)) {
+        set_adoption_state(AdoptionState::Failed);
+        flog("[overlay-v2] [ERROR] adoption hook transaction failed; "
+             "late adoption unavailable");
+        return;
     }
-    g_adoption_hooks_installed = true;
     set_adoption_state(AdoptionState::Pending);
     query_nvapi_current_hdr(game_window_hint);
     flog("[overlay-v2] swapchain adoption armed: watching live presents for "

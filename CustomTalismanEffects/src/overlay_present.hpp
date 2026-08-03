@@ -41,29 +41,29 @@ bool install_hooks();
 bool hooks_installed();
 
 // Late-load fallback: when the game created its swapchain before
-// install_hooks() could observe it (delayed loaders, injectors), this arms
-// pass-through Present observers that find the live swapchain, install the
-// same per-instance shadow on it, and bind its queue only from exact or
-// single-direct-queue evidence (Elden Ring adapter); anything ambiguous stays
-// pass-through.  Idempotent while pending; calling again after a resolution
-// re-arms the search.  Overlay/control thread only.  The hint window (may be
+// install_hooks() could observe it (delayed loaders, injectors), this activates
+// resident pass-through Present observers that find the live swapchain,
+// install the same per-instance shadow on it, and bind its queue from DXGI, an
+// exact hudhook-compatible embedded-pointer match, or the conservative
+// single-direct-queue Elden Ring adapter. Anything ambiguous stays
+// pass-through. Idempotent while pending; calling again after a resolution
+// re-arms the search. Overlay/control thread only. The hint window (may be
 // null) selects the display for a one-shot vendor HDR state query.
 void arm_adoption(HWND game_window_hint);
 
-// Log where the creation-hook prologues (or factory vtable slots) point today
-// and how often the detours have run -- distinguishes "loaded too late" from
-// "hook overwritten by another mod", and names the owning module in the
-// latter case.
+// Log where the creation-hook prologues point today and how often the detours
+// have run -- distinguishes "loaded too late" from "hook overwritten by
+// another mod", and names the owning module in the latter case.
 void log_creation_hook_forensics();
 
-// True once a swapchain creation has been observed through this mod's own
+// True once a swapchain creation has been observed through CustomTalismanEffects's own
 // creation detours AND that swapchain was shadowed and queue-bound.  A visible
-// game window is NOT evidence of a late load: bootstrap does config and
+// game window is NOT evidence of a late load: bootstrap does config, i18n, and
 // flag-scanner work between installing the hooks and reaching the discovery
 // check, so the game can legitimately create and present its swapchain in that
-// window.  Arming adoption on window presence alone is a false positive that
-// costs three extra process-wide detours and, because try_adopt_swapchain
-// rejects any already-shadowed chain, can never help.
+// window. A false result means the creation path did not fully establish the
+// shadow+queue pair; adoption may then discover a missed chain or repair an
+// eligible shadow whose wrapper made the original queue evidence ambiguous.
 bool observed_swapchain_creation();
 
 // Current selected game canvas.  A seqlock makes this safe to read without

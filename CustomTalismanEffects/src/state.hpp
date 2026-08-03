@@ -78,6 +78,11 @@ struct State {
     std::string import_from_key;
     bool import_requested = false;
 
+    // Hide the HUD status icons of the effects THIS MOD applies. A talisman the
+    // player physically wears keeps its icon -- its ids never reach the worker's
+    // `applied` set. See icons.hpp.
+    bool hide_effect_icons = false;
+
     bool show_descriptions = true;
     int  sort_mode = 0; // 0 = Talisman ID, 1 = Name, 2 = Group (in-game order)
 

@@ -44,6 +44,9 @@ bool g_close_requested = false;
 char g_filter[64] = "";
 int  g_import_sel = 0;
 bool g_prev_lb = false, g_prev_rb = false;
+// "Options" header: collapsed by default (the list is what players want to see);
+// like the search text, the expanded state survives a close within a session.
+bool g_settings_open = false;
 
 // ── resolution-based overlay scale ──
 // The panel was authored against a ~1440p canvas; on 4K screens its 18px type
@@ -322,16 +325,29 @@ Result draw(const Frame& f) {
         ImGui::Spacing();
     }
 
-    // ── Settings: the global toggles, grouped and set off from the list below ──
-    bool stacking = g_state.allow_stacking;
-    if (ImGui::Checkbox("Allow stacking (ignore talisman families)", &stacking)) {
-        g_state.allow_stacking = stacking;
-        if (!stacking) collapse_groups_locked();
-    }
-    bool progression = g_state.progression_mode;
-    if (ImGui::Checkbox("Progression mode (owned talismans only)", &progression)) {
-        g_state.progression_mode = progression;
-        g_state.save_requested = true; // persist the toggle like the others
+    // ── Settings: the global toggles, collapsed by default so the talisman list
+    //    gets the vertical space. The open/closed state lives in g_settings_open
+    //    (kept across opens like the search text, not persisted to disk).
+    ImGui::SetNextItemOpen(g_settings_open, ImGuiCond_Always);
+    g_settings_open = ImGui::CollapsingHeader("Options"); // click toggles + returns the new state
+    if (g_settings_open) {
+        ImGui::Indent(8.0f * g_ui_scale);
+        bool stacking = g_state.allow_stacking;
+        if (ImGui::Checkbox("Allow stacking (ignore talisman families)", &stacking)) {
+            g_state.allow_stacking = stacking;
+            if (!stacking) collapse_groups_locked();
+        }
+        bool progression = g_state.progression_mode;
+        if (ImGui::Checkbox("Progression mode (owned talismans only)", &progression)) {
+            g_state.progression_mode = progression;
+            g_state.save_requested = true; // persist the toggle like the others
+        }
+        bool hide_icons = g_state.hide_effect_icons;
+        if (ImGui::Checkbox("Hide effect icons (this mod's talismans only)", &hide_icons)) {
+            g_state.hide_effect_icons = hide_icons;
+            g_state.save_requested = true;
+        }
+        ImGui::Unindent(8.0f * g_ui_scale);
     }
     ImGui::Spacing();
     ImGui::Separator();

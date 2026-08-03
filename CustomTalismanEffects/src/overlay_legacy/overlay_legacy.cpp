@@ -1,35 +1,30 @@
-// The overlay's INPUT + FRONTEND CONTROL layer.  Graphics submission no longer
-// happens here: this thread owns ImGui and publishes immutable CPU draw packets;
-// overlay_present.cpp consumes them inline on the game's Present thread.
+// The LEGACY overlay's INPUT + LIFECYCLE layer: focus-free keyboard/mouse/gamepad
+// capture, the open/close state machine, the overlay thread and its watchdogs.
 //
-// This replaces the previous separate-window overlay (its own top-most D3D11 +
-// DirectComposition window). That design existed to avoid touching the game's
-// swapchain at all; backend v2 reaches the same goal from the other side -- it
-// observes DXGI creation, composites into the game's EXISTING D3D12 backbuffer
-// with private resources immediately before the real Present, and creates no
-// window, device, queue, or presentation swapchain of its own. See
-// overlay_present.cpp for the invariants that keep that safe alongside other
-// injected overlays, frame-gen mods and Special K.
+// This is backend v1, kept as the opt-in fallback for setups the in-swapchain
+// backend v2 doesn't work on. It runs ONLY when the .ini says
+// `[overlay_render] renderer = window`; otherwise none of this file executes.
+// See overlay_legacy.hpp.
 //
 // The other two thirds live next door and this file drives both:
-//   - overlay_present.cpp -- DXGI hook chaining, swapchain/queue validation,
-//     and the private D3D12 renderer that targets the game's current buffer.
-//   - overlay_ui.cpp -- the talisman panel itself. Backend-agnostic; it gets a
-//     ui::Frame snapshot each frame and hands back a ui::Result.
+//   - overlay_legacy_present.cpp -- the window, D3D11 and the layered-window
+//     present path. Read ITS header comment before touching anything about how
+//     pixels reach the screen.
+//   - overlay_ui.cpp -- the quest panel itself, SHARED with backend v2 and not
+//     duplicated here. Backend-agnostic; it gets a ui::Frame snapshot each frame
+//     and hands back a ui::Result.
 //
 // Architecture:
-//   - bootstrap() installs lightweight graphics discovery hooks early. It MUST
-//     run before any slow worker work (config parsing, the compat wait, param
-//     waits): missing the game's CreateSwapChain* transaction makes exact D3D12
-//     queue association impossible, and the overlay then stays unavailable.
-//   - setup() resolves the input APIs and spawns a detached control thread. It
-//     creates a message-only input sink plus this mod's private ImGui context;
-//     it never creates a visible window, graphics device, or swapchain.
+//   - setup() resolves + detours the pad APIs (see the input section) and
+//     spawns a detached overlay thread that creates the window + D3D11 + ImGui
+//     and runs the render loop. setup() returns fast; the thread owns all
+//     overlay state, and nothing here is thread-safe beyond the handful of
+//     atomics the detours read.
 //   - Each iteration the game's client area ("the canvas") is re-tracked; the
 //     ImGui logical canvas always spans it, whatever the window's actual box.
-//   - Open/close (default Insert / L3+R3) + Esc/B are polled with GetAsyncKeyState.
+//   - Open/close (default End / L3+R3) + Esc/B are polled with GetAsyncKeyState.
 //   - While the menu is open, keyboard + mouse are captured focus-free by
-//     re-targeting the process's raw-input registration at our window (which
+//     re-targeting the process's raw-input registration at my window (which
 //     also starves the game's raw-input reader, so menu input never leaks into
 //     gameplay). The virtual cursor follows the native OS position once the
 //     game's pin is intercepted, with raw-delta integration as a safe fallback;
@@ -57,11 +52,12 @@
 #include <vector>
 
 #include <imgui.h>
+#include <backends/imgui_impl_dx11.h>
 #include <backends/imgui_impl_win32.h>
 
-#include "overlay.hpp"
-#include "overlay_coexist.hpp"
-#include "overlay_present.hpp"
+#include "overlay_legacy.hpp"
+#include "overlay_legacy_input.hpp"
+#include "overlay_legacy_present.hpp"
 #include "overlay_ui.hpp"
 #include "state.hpp"
 #include "hooks.hpp"
@@ -75,7 +71,9 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 namespace cte {
 
-namespace present = overlay::present;
+namespace present = overlay_legacy::present;
+// The quest panel is the mod's shared frontend (src/overlay_ui.cpp), used by
+// both backends -- this alias deliberately still points into cte::overlay.
 namespace ui = overlay::ui;
 
 namespace {
@@ -88,20 +86,10 @@ XInputGetState_t pXInputGetState = nullptr; // real pad reader (MinHook trampoli
 unsigned int   g_open_vk = 0x2D;         // VK_INSERT
 unsigned short g_open_pad_mask = 0x00C0; // L3+R3
 bool g_open_pad_is_hold = false;         // true if the combo needs a hold, not a tap
-constexpr long long kPadHoldMs = 550;    // hardcoded hold duration for HOLD_ combos
+constexpr long long kPadHoldMs = 550;   // hardcoded hold duration for HOLD_ combos
 
 std::atomic<bool> g_running{false};   // overlay thread alive
 std::atomic<bool> g_menu_open{false};
-
-// A message-only HWND receives raw input while the menu is open.  It is not a
-// top-level or composited surface and can never activate, occlude, or alter the
-// game's presentation mode.
-HWND g_input_hwnd = nullptr;
-HWND g_game_hwnd = nullptr;
-UINT g_back_w = 0, g_back_h = 0;
-POINT g_canvas_pos{};
-int g_client_w = 0, g_client_h = 0;
-ImGuiContext* g_imgui_context = nullptr;
 
 // ── gamepad snapshot (real state read via the trampoline) ──
 XINPUT_GAMEPAD g_pad{};
@@ -123,10 +111,10 @@ bool foreground_is_ours() {
 // The game must NEVER lose foreground activation: frame-generation mods
 // (erdGameTools / NVIDIA Smooth Motion) tear their pipeline down and re-init
 // it whenever the game window is deactivated OR reactivated -- a multi-second
-// frozen-frame stall (a plain alt-tab reproduces it with this mod unloaded).
-// There is no overlay window to activate any more, and we never call
-// SetForegroundWindow in either direction. While the menu is open, input is
-// captured WITHOUT focus:
+// frozen-frame stall (a plain alt-tab reproduces it with CustomTalismanEffects unloaded).
+// The overlay window is therefore permanently WS_EX_NOACTIVATE and we never
+// call SetForegroundWindow in either direction. While the menu is open, input
+// is captured WITHOUT focus:
 //   - Keyboard + mouse: the process's raw-input registration is re-targeted at
 //     our window (RegisterRawInputDevices is per-process, per-usage, so one
 //     call both routes WM_INPUT to us and SILENCES the game's raw-input reader
@@ -144,15 +132,17 @@ bool foreground_is_ours() {
 //     is open: XInputGetState + XInputGetStateEx(#100), and -- the one ER
 //     actually uses -- IDirectInputDevice8::GetDeviceState/GetDeviceData via
 //     the shared dinput8 vtable. Our own polling reads the real state via the
-//     XInput trampoline. (Two mods detouring the same code chain fine -- sibling
-//     mods ship similar hooks -- as long as nobody unhooks mid-run; nobody does.)
+//     XInput trampoline. (Two mods detouring the same code chain fine -- CTE
+//     ships similar hooks -- as long as nobody unhooks mid-run; nobody does.)
 //
 // There is exactly ONE input mode. The old [overlay] focus_input = 1 escape
-// hatch (the overlay window taking focus like a normal window) is gone with the
-// window it applied to: the behavior it restored -- programmatically activating
-// our window on open and the game's on close -- IS the alt-tab-freeze bug that
-// the focus-free design exists to avoid. The .ini key is retired and stripped
-// from the file on the next save; do not reintroduce the mode.
+// hatch (the overlay taking focus like a normal window) was removed on
+// 2026-07-18: it was a second, never-exercised input architecture threaded
+// through every function here as a conditional, and the behavior it restored --
+// programmatically activating our window on open and the game's on close -- IS
+// the alt-tab-freeze bug that the focus-free design exists to avoid. Do not
+// reintroduce it; if focus-free capture ever misbehaves, fix it here rather
+// than adding a second path to fall back to.
 
 // Read the real pad (through the trampoline) for ImGui nav + the open combo.
 void poll_gamepad() {
@@ -176,8 +166,9 @@ void feed_gamepad() {
     // Only strip the toggle-combo buttons (e.g. A+UP) from nav while that FULL
     // combo is actually held down together -- that's the one instant we must
     // stop it from also acting as a nav press. Stripping the bits unconditionally
-    // permanently disables plain A (confirm) and plain DPad-Up (nav) for as long
-    // as the menu stays open when either happens to be part of the open combo.
+    // (the old behavior) permanently disabled plain A (confirm) and plain DPad-Up
+    // (nav) for as long as the menu stayed open, since both happen to be part of
+    // the default open combo.
     const bool combo_held = g_open_pad_mask &&
         (g_pad.wButtons & g_open_pad_mask) == g_open_pad_mask;
     const WORD nbt = combo_held ? (g_pad.wButtons & ~g_open_pad_mask) : g_pad.wButtons;
@@ -189,7 +180,7 @@ void feed_gamepad() {
     io.AddKeyEvent(ImGuiKey_GamepadFaceRight, (nbt & XINPUT_GAMEPAD_B) != 0);
     // Y is intentionally NOT mapped to GamepadFaceUp: ImGui treats FaceUp as a
     // second generic "activate" input alongside A, so leaving it mapped made Y
-    // toggle checkboxes too. Only A should confirm.
+    // open/close quest cards too. Only A should confirm.
     io.AddKeyEvent(ImGuiKey_GamepadFaceLeft,  (nbt & XINPUT_GAMEPAD_X) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadL1,        (nbt & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadR1,        (nbt & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0);
@@ -392,16 +383,12 @@ void hook_dinput8() {
         di->Release(); // vtable code stays resident in dinput8.dll
     }
     if (!found) {
-        flog("[overlay] [WARN] dinput8 vtable resolve failed; pad may leak while menu open");
+        flog("[overlay-legacy] [WARN] dinput8 vtable resolve failed; pad may leak while menu open");
         return;
     }
 
     const DIGetDeviceState_t sdet[2] = {&di_state_detour<0>, &di_state_detour<1>};
     const DIGetDeviceData_t  ddet[2] = {&di_data_detour<0>, &di_data_detour<1>};
-    // Serialize create->apply against any other mod embedding this backend;
-    // an interleaved install silently erases one side's detour (hooks.hpp).
-    // A clobber here leaks pad input to the game while the menu is open.
-    hooks::InstallLock install_lock;
     bool queued = false;
     for (int i = 0; i < found; ++i) {
         if (hooks::create(state_fns[i], reinterpret_cast<void*>(sdet[i]),
@@ -413,25 +400,26 @@ void hook_dinput8() {
     }
     if (queued && hooks::apply()) {
         g_dinput_hooked.store(true);
-        flog("[overlay] dinput8 GetDeviceState/GetDeviceData detoured (%d vtable%s)",
+        flog("[overlay-legacy] dinput8 GetDeviceState/GetDeviceData detoured (%d vtable%s)",
              found, found > 1 ? "s" : "");
     } else {
-        flog("[overlay] [WARN] dinput8 hook failed; pad may leak while menu open");
+        flog("[overlay-legacy] [WARN] dinput8 hook failed; pad may leak while menu open");
     }
 }
 
 // Detour XInputGetState + XInputGetStateEx(#100) in every currently-loaded
 // xinput module. Idempotent; called on EVERY menu open, never at setup().
-// Rationale: hooking early is what broke pad blocking -- without erdGameTools'
-// init delay we hooked xinput1_4 early and dpad/LB/RB still leaked, while the
-// delayed run hooked LATE and blocked everything. Hooking at first menu open
-// guarantees (a) any lazily loaded xinput modules exist by then and (b) our
-// detour is patched in LAST, i.e. outermost -- anything that hooked the same
-// export earlier (Steam Input's emulation layer etc.) runs INSIDE us, so our
-// zeroing is what the game finally receives.
+// Rationale (2026-07-13 logs): hooking early is what broke pad blocking --
+// without erdGameTools' 12s init delay we hooked xinput1_4 at ~6s and dpad/
+// LB/RB still leaked, while the erdGameTools-delayed run hooked LATE and
+// blocked everything. Hooking at first menu open guarantees (a) any lazily
+// loaded xinput modules exist by then and (b) our detour is patched in LAST,
+// i.e. outermost -- anything that hooked the same export earlier (Steam
+// Input's emulation layer etc.) runs INSIDE us, so our zeroing is what the
+// game finally receives.
 void* g_xi_seen[6] = {};
 int   g_xi_slot = 0;
-bool  g_mh_ok = false; // hooks::init() result, set in bootstrap()/setup()
+bool  g_mh_ok = false; // hooks::init() result, set in setup()
 
 void hook_xinput() {
     if (!g_mh_ok || g_xi_slot >= 6) return;
@@ -439,7 +427,6 @@ void hook_xinput() {
     using Detour_t = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
     const Detour_t detours[6] = {&xi_detour<0>, &xi_detour<1>, &xi_detour<2>,
                                  &xi_detour<3>, &xi_detour<4>, &xi_detour<5>};
-    hooks::InstallLock install_lock; // see hooks.hpp -- create->apply must be atomic
     bool queued = false;
     for (const char* d : xdlls) {
         HMODULE h = GetModuleHandleA(d);
@@ -466,16 +453,16 @@ void hook_xinput() {
                     pXInputGetState = g_xi_real[g_xi_slot];
                 ++g_xi_slot;
                 queued = true;
-                flog("[overlay] XInputGetState%s detoured in %s",
+                flog("[overlay-legacy] XInputGetState%s detoured in %s",
                      e ? "Ex(#100)" : "", d);
             }
         }
     }
     if (queued && !hooks::apply())
-        flog("[overlay] [WARN] MinHook apply failed; pad may leak to the game while menu open");
+        flog("[overlay-legacy] [WARN] MinHook apply failed; pad may leak to the game while menu open");
 }
 
-// ── cursor unpin (the real pointer speed/teleport fix) ──
+// ── cursor unpin (bug 2, the real speed/teleport fix) ──
 // During gameplay ER re-pins the hidden OS cursor to the screen centre every
 // frame via SetCursorPos (and may confine it with ClipCursor). That pin is
 // WHY update_virtual_cursor's hidden-cursor branch has to integrate raw
@@ -498,13 +485,14 @@ std::atomic<bool> g_unpin_hooked{false};
 // SetCursorPos detour (not just an assumption) -- update_virtual_cursor's
 // free-cursor branch is gated on it, so if ER ever pins through some
 // mechanism we didn't hook, no blocks get counted and the code silently stays
-// on the pre-existing integration fallback (a stuck cursor cannot come back).
-// Swallowed ClipCursor calls deliberately do NOT count: intercepting a clip
-// proves nothing about how the position is pinned, and counting them once
-// froze the pointer mid-screen in Fullscreen display mode (the game clipped
-// through user32 -- swallowed, counted -- while re-pinning the position
-// through a path our detour never saw, so GetCursorPos kept reading the
-// pinned centre while we "proved" it free). Reset to 0 at each menu open.
+// on the pre-existing integration fallback (the round-3 stuck-cursor bug
+// cannot come back). Swallowed ClipCursor calls deliberately do NOT count:
+// intercepting a clip proves nothing about how the position is pinned, and
+// counting them once froze the pointer mid-screen in Fullscreen display mode
+// (the game clipped through user32 -- swallowed, counted -- while re-pinning
+// the position through a path our detour never saw, so GetCursorPos kept
+// reading the pinned centre while we "proved" it free). Reset to 0 at each
+// menu open.
 std::atomic<uint32_t> g_scp_blocks{0};
 
 // The game's last wanted clip rect while we were swallowing its ClipCursor
@@ -558,27 +546,26 @@ BOOL real_clip(const RECT* rc) {
 void hook_cursor_unpin() {
     if (g_unpin_hooked.load(std::memory_order_acquire)) return;
     if (!g_mh_ok) {
-        flog("[overlay] [WARN] cursor-unpin unavailable (MinHook inactive); "
+        flog("[overlay-legacy] [WARN] cursor-unpin unavailable (MinHook inactive); "
              "pointer speed fix inactive");
         return;
     }
     HMODULE u32 = GetModuleHandleA("user32.dll");
     if (!u32) {
-        flog("[overlay] [WARN] cursor-unpin resolve failed (user32 missing); "
+        flog("[overlay-legacy] [WARN] cursor-unpin resolve failed (user32 missing); "
              "pointer speed fix inactive");
         return;
     }
     void* scp = reinterpret_cast<void*>(GetProcAddress(u32, "SetCursorPos"));
     void* clip = reinterpret_cast<void*>(GetProcAddress(u32, "ClipCursor"));
     if (!scp || !clip) {
-        flog("[overlay] [WARN] cursor-unpin resolve failed; pointer speed fix inactive");
+        flog("[overlay-legacy] [WARN] cursor-unpin resolve failed; pointer speed fix inactive");
         return;
     }
     // These locals are overlay-thread-only bookkeeping. Keeping successful
     // creates across opens avoids asking MinHook to create the same target
     // twice, and lets a failed MH_ApplyQueued be retried directly.
     static bool scp_created = false, clip_created = false;
-    hooks::InstallLock install_lock; // see hooks.hpp -- create->apply must be atomic
     if (!scp_created)
         scp_created = hooks::create(
             scp, reinterpret_cast<void*>(&scp_detour),
@@ -591,10 +578,10 @@ void hook_cursor_unpin() {
     const bool applied = hooks::apply();
     if (scp_created && clip_created && applied) {
         g_unpin_hooked.store(true, std::memory_order_release);
-        flog("[overlay] SetCursorPos/ClipCursor detoured "
+        flog("[overlay-legacy] SetCursorPos/ClipCursor detoured "
              "(cursor stays free while menu open)");
     } else {
-        flog("[overlay] [WARN] cursor-unpin hook incomplete "
+        flog("[overlay-legacy] [WARN] cursor-unpin hook incomplete "
              "(SetCursorPos=%s ClipCursor=%s apply=%s); pointer speed fix inactive",
              scp_created ? "ok" : "failed",
              clip_created ? "ok" : "failed", applied ? "ok" : "failed");
@@ -606,6 +593,15 @@ void hook_cursor_unpin() {
 // ClipCursor when the desired rect actually changed, not every frame.
 bool g_clip_applied = false;
 RECT g_clip_rect_applied{};
+
+// While the menu is open but the game is NOT foreground (alt-tab, or the game
+// got minimized under us -- the DXGI fullscreen kick), the hit-testable
+// overlay window must not sit over the desktop swallowing clicks: the user
+// couldn't even close it, since Esc/B polling is gated on foreground being
+// ours. After a short debounce (foreground flickers during window
+// transitions) the window goes click-through until the game is back.
+ULONGLONG g_fg_lost_since = 0;   // tick of the first !fg_ours open frame, 0 = fg ok
+bool g_bg_click_through = false; // we switched the OPEN window to click-through
 
 // ── raw-input capture (keyboard/mouse without focus) ──
 // Windows keeps ONE raw-input registration per usage per process; registering
@@ -621,7 +617,7 @@ constexpr USHORT kHidPage = 0x01, kHidMouse = 0x02, kHidKeyboard = 0x06,
                  kHidPageOnly = 0x00; // RIDEV_PAGEONLY whole-page registration
 
 // Matches a specific mouse/keyboard registration OR a PAGEONLY whole-page
-// registration (usUsage 0) that covers them. An earlier version of this
+// registration (usUsage 0) that covers them. The earlier version of this
 // function ignored PAGEONLY entries entirely: some raw-input consumers
 // register the whole generic-desktop page instead of mouse/keyboard
 // individually, so the open-time snapshot could come back looking empty for
@@ -638,8 +634,9 @@ bool rid_is_kbm(const RAWINPUTDEVICE& r) {
 // GetRegisteredRawInputDevices is two calls (query the count, then fetch); if
 // another thread registers a device between them, the second call returns
 // (UINT)-1 (buffer now too small) instead of the entries. Treating that as
-// "nothing registered" is another way the snapshot could come back empty when
-// it shouldn't. Retry the whole count+fetch a few times before giving up.
+// "nothing registered" -- the old behavior -- is another way the snapshot
+// could come back empty when it shouldn't. Retry the whole count+fetch a few
+// times before actually giving up.
 std::vector<RAWINPUTDEVICE> rid_process_kbm() {
     for (int attempt = 0; attempt < 3; ++attempt) {
         UINT n = 0;
@@ -657,15 +654,15 @@ std::vector<RAWINPUTDEVICE> rid_process_kbm() {
             if (rid_is_kbm(r)) out.push_back(r);
         return out;
     }
-    flog("[overlay] [WARN] rid_process_kbm: GetRegisteredRawInputDevices "
+    flog("[overlay-legacy] [WARN] rid_process_kbm: GetRegisteredRawInputDevices "
          "failed/raced 3x; treating as no registrations");
     return {};
 }
 
 bool rid_register_ours() {
     RAWINPUTDEVICE rid[2] = {
-        {kHidPage, kHidMouse,    RIDEV_INPUTSINK, g_input_hwnd},
-        {kHidPage, kHidKeyboard, RIDEV_INPUTSINK, g_input_hwnd},
+        {kHidPage, kHidMouse,    RIDEV_INPUTSINK, present::g_hwnd},
+        {kHidPage, kHidKeyboard, RIDEV_INPUTSINK, present::g_hwnd},
     };
     return RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE)) != FALSE;
 }
@@ -686,7 +683,7 @@ void log_rid_state(const char* tag) {
             continue;
         }
         if (!n) {
-            flog("[overlay] rawinput %s: 0 registrations", tag);
+            flog("[overlay-legacy] rawinput %s: 0 registrations", tag);
             return;
         }
         std::vector<RAWINPUTDEVICE> all(n);
@@ -699,10 +696,10 @@ void log_rid_state(const char* tag) {
         all.resize(got);
         for (const auto& r : all) {
             const char* who = !r.hwndTarget ? "null"
-                             : r.hwndTarget == g_input_hwnd ? "ours"
-                             : r.hwndTarget == g_game_hwnd ? "game"
+                             : r.hwndTarget == present::g_hwnd ? "ours"
+                             : r.hwndTarget == present::g_game_hwnd ? "game"
                              : "other";
-            flog("[overlay] rawinput %s: page=0x%X usage=0x%X "
+            flog("[overlay-legacy] rawinput %s: page=0x%X usage=0x%X "
                  "flags=0x%08X hwnd=%p (%s)", tag,
                  static_cast<unsigned>(r.usUsagePage),
                  static_cast<unsigned>(r.usUsage),
@@ -710,7 +707,7 @@ void log_rid_state(const char* tag) {
         }
         return;
     }
-    flog("[overlay] [WARN] rawinput %s: GetRegisteredRawInputDevices "
+    flog("[overlay-legacy] [WARN] rawinput %s: GetRegisteredRawInputDevices "
          "failed/raced 3x (err %lu)", tag, err);
 }
 
@@ -721,7 +718,7 @@ void log_rid_state(const char* tag) {
 // usages, and that half-stolen registration must not leak forever.
 //
 // For each of mouse (0x02) and keyboard (0x06):
-//   - a captured SPECIFIC entry restores verbatim;
+//   - a captured SPECIFIC entry restores verbatim (unchanged behavior);
 //   - no specific entry but a captured PAGEONLY entry means the game's
 //     whole-page registration was never displaced -- just remove our own
 //     specific registration and let the page registration keep covering it;
@@ -750,9 +747,9 @@ bool raw_input_restore() {
             restore.push_back(*specific[i]);
         } else if (pageonly) {
             restore.push_back({kHidPage, usages[i], RIDEV_REMOVE, nullptr});
-        } else if (g_game_hwnd && IsWindow(g_game_hwnd)) {
-            restore.push_back({kHidPage, usages[i], 0, g_game_hwnd});
-            flog("[overlay] [WARN] raw-input restore: no prior %s registration "
+        } else if (present::g_game_hwnd && IsWindow(present::g_game_hwnd)) {
+            restore.push_back({kHidPage, usages[i], 0, present::g_game_hwnd});
+            flog("[overlay-legacy] [WARN] raw-input restore: no prior %s registration "
                  "was captured -- pointing raw %s at the game window",
                  names[i], names[i]);
         } else {
@@ -780,11 +777,11 @@ bool raw_input_restore() {
         if (!RegisterRawInputDevices(&rm, 1, sizeof(RAWINPUTDEVICE))) ok = false;
     }
     if (!ok) {
-        flog("[overlay] [ERROR] raw-input restore failed (err %lu) -- "
+        flog("[overlay-legacy] [ERROR] raw-input restore failed (err %lu) -- "
              "game input may be dead; retrying", GetLastError());
         return false;
     }
-    flog("[overlay] [WARN] raw-input restore downgraded to unregister");
+    flog("[overlay-legacy] [WARN] raw-input restore downgraded to unregister");
     return true;
 }
 
@@ -792,7 +789,7 @@ void raw_input_capture(bool on) {
     if (on == g_raw_captured) return;
     if (on) {
         g_rid_saved = rid_process_kbm();
-        flog("[overlay] rawinput: captured %zu kb/mouse entr%s",
+        flog("[overlay-legacy] rawinput: captured %zu kb/mouse entr%s",
              g_rid_saved.size(), g_rid_saved.size() == 1 ? "y" : "ies");
         log_rid_state("at capture"); // right BEFORE registering ours
         if (!rid_register_ours()) {
@@ -802,7 +799,7 @@ void raw_input_capture(bool on) {
             // away so that half-stolen registration can't leak forever (close
             // would never restore it: g_raw_captured stays false below).
             raw_input_restore();
-            flog("[overlay] [WARN] raw-input capture failed (err %lu) -- "
+            flog("[overlay-legacy] [WARN] raw-input capture failed (err %lu) -- "
                  "keyboard/mouse degraded while menu open", capture_error);
             return;
         }
@@ -827,7 +824,7 @@ void raw_input_reassert() {
     if (!g_raw_captured) return;
     bool mouse_ours = false, keyboard_ours = false, saw_newcomer = false;
     for (const auto& r : rid_process_kbm()) {
-        if (r.hwndTarget == g_input_hwnd) {
+        if (r.hwndTarget == present::g_hwnd) {
             if (r.usUsage == kHidMouse) mouse_ours = true;
             else if (r.usUsage == kHidKeyboard) keyboard_ours = true;
             continue;
@@ -857,7 +854,7 @@ void raw_input_reassert() {
     }
     if ((!mouse_ours || !keyboard_ours || saw_newcomer) &&
         !rid_register_ours())
-        flog("[overlay] [WARN] raw-input re-assert failed (err %lu)", GetLastError());
+        flog("[overlay-legacy] [WARN] raw-input re-assert failed (err %lu)", GetLastError());
 }
 
 // ── WM_INPUT -> ImGui ──
@@ -867,7 +864,7 @@ void raw_input_reassert() {
 //     raw-input starvation doesn't stop the OS pointer itself): GetCursorPos
 //     is the truth and the OS arrow is the one pointer. Integrating a private
 //     cursor from raw deltas alongside it made TWO diverging pointers (the
-//     double-cursor bug).
+//     double-cursor bug, round 2).
 //   - OS cursor HIDDEN (normal gameplay): once the SetCursorPos detour has
 //     demonstrably swallowed the game's position pin (and a liveness check
 //     confirms the OS position actually follows the mouse -- Fullscreen mode
@@ -880,9 +877,9 @@ float g_vmx = 0.0f, g_vmy = 0.0f;       // virtual cursor, canvas coords
 float g_raw_dx = 0.0f, g_raw_dy = 0.0f; // relative deltas since last frame
 float g_raw_ax = -1.0f, g_raw_ay = -1.0f; // pending absolute pos (screen px), <0 = none
 
-// Windows pointer-speed multiplier applied to integrated raw deltas.
-// Recomputed once at each menu open by mouse_speed_multiplier(); left at 1.0
-// (Control Panel default) until the first open.
+// Windows pointer-speed multiplier applied to integrated raw deltas (2.1
+// below). Recomputed once at each menu open by mouse_speed_multiplier();
+// left at 1.0 (Control Panel default) until the first open.
 float g_mouse_scale = 1.0f;
 
 void raw_mouse(const RAWMOUSE& m, ImGuiIO& io) {
@@ -920,72 +917,33 @@ void raw_mouse(const RAWMOUSE& m, ImGuiIO& io) {
 }
 
 // Forward a raw key as a synthetic WM_KEY* to the ImGui Win32 backend (reuses
-// its full VK -> ImGuiKey mapping), then translate printable keys ourselves.
-// A message-only HWND can receive WM_INPUT but never the normal WM_CHAR stream;
-// forwarding a synthetic WM_CHAR back through the HWND backend left InputText
-// dependent on focus state that this window can never own. Feed UTF-16 straight
-// into this private ImGui context instead. IME still requires a real focused
-// text service, but normal layout/dead-key text works without activating or
-// deactivating the game window.
-uint32_t g_raw_key_events = 0;
-uint32_t g_text_characters = 0;
-bool g_search_activated = false;
-bool g_imgui_focus_known = false;
-bool g_imgui_focused = false;
-
+// its full VK -> ImGuiKey mapping) plus WM_CHAR text via ToUnicode. The
+// backend's own modifier reads (GetKeyState) are stale on this never-focused
+// thread; update_modifiers() below feeds the truth every frame. No IME without
+// focus -- acceptable for the ASCII-lowercased search box.
 void raw_keyboard(const RAWKEYBOARD& k) {
     if (k.VKey == 0 || k.VKey >= 255) return; // fake keys / overrun marker
-    ++g_raw_key_events;
     const bool down = (k.Flags & RI_KEY_BREAK) == 0;
     const UINT scan = k.MakeCode & 0xFFu;
     LPARAM lp = 1 | (static_cast<LPARAM>(scan) << 16);
     if (k.Flags & RI_KEY_E0) lp |= static_cast<LPARAM>(1) << 24;
     if (!down) lp |= (static_cast<LPARAM>(1) << 30) | (static_cast<LPARAM>(1) << 31);
-    ImGui_ImplWin32_WndProcHandler(g_input_hwnd, down ? WM_KEYDOWN : WM_KEYUP,
+    ImGui_ImplWin32_WndProcHandler(present::g_hwnd, down ? WM_KEYDOWN : WM_KEYUP,
                                    k.VKey, lp);
 
-    if (!down) return;
-
-    // Ctrl/Alt shortcuts must not emit text. Right-Alt (AltGr) is the exception:
-    // Windows exposes it as Ctrl+Alt and many European layouts need it.
-    const bool ctrl = kd(VK_CONTROL);
-    const bool alt = kd(VK_MENU);
-    const bool altgr = kd(VK_RMENU) && ctrl;
-    if ((ctrl || alt) && !altgr) return;
-
+    if (!down || kd(VK_CONTROL) || kd(VK_MENU)) return; // no text from chords
     BYTE ks[256] = {};
-    const int live_keys[] = {
-        VK_SHIFT, VK_LSHIFT, VK_RSHIFT,
-        VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
-        VK_MENU, VK_LMENU, VK_RMENU
-    };
-    for (const int vk : live_keys)
-        if (kd(vk)) ks[vk] = 0x80;
-    // ToUnicodeEx expects the key being translated to be down even though this
-    // thread never receives a conventional WM_KEYDOWN for it.
-    ks[k.VKey] |= 0x80;
-    if (GetKeyState(VK_CAPITAL) & 1) ks[VK_CAPITAL] |= 0x01;
-    if (GetKeyState(VK_NUMLOCK) & 1) ks[VK_NUMLOCK] |= 0x01;
-    if (GetKeyState(VK_SCROLL) & 1) ks[VK_SCROLL] |= 0x01;
-
-    DWORD game_tid = 0;
-    if (g_game_hwnd) game_tid = GetWindowThreadProcessId(g_game_hwnd, nullptr);
-    const HKL layout = GetKeyboardLayout(game_tid);
-    UINT unicode_scan = scan;
-    if (k.Flags & RI_KEY_E0) unicode_scan |= 0xE000u;
-    WCHAR buf[8] = {};
-    const int n = ToUnicodeEx(k.VKey, unicode_scan, ks, buf,
-                              static_cast<int>(sizeof(buf) / sizeof(buf[0])), 0, layout);
-    if (n <= 0) return; // n < 0 leaves a dead key ready for the next character
-    ImGuiIO& io = ImGui::GetIO();
-    for (int i = 0; i < n; ++i) {
-        if (buf[i] < 32) continue;
-        io.AddInputCharacterUTF16(static_cast<ImWchar16>(buf[i]));
-        ++g_text_characters;
-    }
+    if (kd(VK_SHIFT)) ks[VK_SHIFT] = 0x80;
+    if (GetKeyState(VK_CAPITAL) & 1) ks[VK_CAPITAL] = 0x01;
+    WCHAR buf[4] = {};
+    const int n = ToUnicode(k.VKey, scan, ks, buf, 4, 0);
+    for (int i = 0; i < n; ++i)
+        if (buf[i] >= 32)
+            ImGui_ImplWin32_WndProcHandler(present::g_hwnd, WM_CHAR, buf[i], 0);
 }
 
-// The message-only input sink's WM_INPUT handler.
+// The overlay window's WM_INPUT handler (exported as input::on_raw_input at the
+// bottom of this file, which is how overlay_legacy_present.cpp's WndProc reaches it).
 bool g_context_ready = false; // ImGui context exists (set once init succeeds)
 
 void handle_raw_input(HRAWINPUT h) {
@@ -1005,149 +963,6 @@ void handle_raw_input(HRAWINPUT h) {
         raw_mouse(ri.data.mouse, ImGui::GetIO());
     else if (ri.header.dwType == RIM_TYPEKEYBOARD)
         raw_keyboard(ri.data.keyboard);
-}
-
-// Process-wide name: it lives in overlay_coexist.hpp with everything else a
-// second copy of this backend would collide on.
-constexpr const wchar_t* kInputWindowClass = coexist::kInputWindowClass;
-
-LRESULT CALLBACK input_wndproc(HWND hwnd, UINT message,
-                               WPARAM wparam, LPARAM lparam) {
-    if (message == WM_INPUT) {
-        handle_raw_input(reinterpret_cast<HRAWINPUT>(lparam));
-        // Required by the raw-input contract for foreground packets; harmless
-        // for RIDEV_INPUTSINK packets.
-        return DefWindowProcW(hwnd, message, wparam, lparam);
-    }
-    if (message == WM_DESTROY) return 0;
-    return DefWindowProcW(hwnd, message, wparam, lparam);
-}
-
-bool create_input_window() {
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = input_wndproc;
-    wc.hInstance = g_hinst;
-    wc.lpszClassName = kInputWindowClass;
-    const ATOM atom = RegisterClassExW(&wc);
-    if (!atom && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
-    g_input_hwnd = CreateWindowExW(
-        0, kInputWindowClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
-        nullptr, g_hinst, nullptr);
-    return g_input_hwnd != nullptr;
-}
-
-void destroy_input_window() {
-    if (g_input_hwnd) {
-        DestroyWindow(g_input_hwnd);
-        g_input_hwnd = nullptr;
-    }
-    UnregisterClassW(kInputWindowClass, g_hinst);
-}
-
-// Refresh the control-thread coordinate mapping from the selected swapchain.
-// Backbuffer pixels and client pixels can differ under compatibility scaling;
-// cursor conversion accounts for that instead of assuming a 1:1 mapping.
-// Why the last refresh_canvas() failed, so the user-visible "menu requested
-// before a validated game swapchain was ready" line is triage-grade on its own.
-// Control thread only.
-const char* g_canvas_block_reason = "not evaluated yet";
-
-bool refresh_canvas() {
-    const present::Canvas host = present::canvas();
-    if (!host.ready || !host.hwnd || !IsWindow(host.hwnd) ||
-        host.width < 2 || host.height < 2) {
-        g_canvas_block_reason =
-            !host.ready      ? "the backend has not published a ready canvas"
-            : !host.hwnd     ? "the published canvas has no window"
-            : !IsWindow(host.hwnd) ? "the published canvas window is gone"
-                             : "the published canvas is degenerate";
-        g_game_hwnd = nullptr;
-        g_back_w = g_back_h = 0;
-        g_client_w = g_client_h = 0;
-        return false;
-    }
-
-    RECT client{};
-    POINT origin{};
-    if (!GetClientRect(host.hwnd, &client) || !ClientToScreen(host.hwnd, &origin)) {
-        g_canvas_block_reason = "the game window geometry is unreadable";
-        return false;
-    }
-    const int client_w = client.right - client.left;
-    const int client_h = client.bottom - client.top;
-    if (client_w < 1 || client_h < 1) {
-        g_canvas_block_reason = "the game client rect is empty";
-        return false;
-    }
-    g_canvas_block_reason = nullptr;
-
-    g_game_hwnd = host.hwnd;
-    g_back_w = host.width;
-    g_back_h = host.height;
-    g_canvas_pos = origin;
-    g_client_w = client_w;
-    g_client_h = client_h;
-    return true;
-}
-
-// Does a plausible game window already exist in this process? Used to detect
-// a late load (the window -- and therefore the swapchain -- predates this
-// mod's DXGI creation hooks) and to pick the display for the adoption path's
-// vendor HDR query. Returns the largest qualifying window.
-HWND find_existing_game_window() {
-    struct Search {
-        HWND best = nullptr;
-        int best_area = 0;
-    } search;
-    EnumWindows(
-        [](HWND hwnd, LPARAM param) -> BOOL {
-            auto* search = reinterpret_cast<Search*>(param);
-            DWORD pid = 0;
-            GetWindowThreadProcessId(hwnd, &pid);
-            if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd) ||
-                GetAncestor(hwnd, GA_ROOT) != hwnd ||
-                (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0)
-                return TRUE;
-            RECT client{};
-            if (!GetClientRect(hwnd, &client)) return TRUE;
-            const int width = client.right - client.left;
-            const int height = client.bottom - client.top;
-            if (width < 640 || height < 360) return TRUE;
-            if (width * height > search->best_area) {
-                search->best_area = width * height;
-                search->best = hwnd;
-            }
-            return TRUE;
-        },
-        reinterpret_cast<LPARAM>(&search));
-    return search.best;
-}
-
-bool init_frontend() {
-    IMGUI_CHECKVERSION();
-    g_imgui_context = ImGui::CreateContext();
-    if (!g_imgui_context) return false;
-    ImGui::SetCurrentContext(g_imgui_context);
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr; // never create imgui.ini
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard |
-                      ImGuiConfigFlags_NavEnableGamepad |
-                      ImGuiConfigFlags_NoMouseCursorChange;
-    ui::load_fonts(io);
-    ui::apply_style();
-    if (!ImGui_ImplWin32_Init(g_input_hwnd)) return false;
-    present::publish_font_atlas(io.Fonts);
-    return present::renderer_healthy();
-}
-
-void shutdown_frontend() {
-    g_context_ready = false;
-    if (!g_imgui_context) return;
-    ImGui::SetCurrentContext(g_imgui_context);
-    ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext(g_imgui_context);
-    g_imgui_context = nullptr;
 }
 
 // Feed modifier state from the hardware. The win32 backend derives modifiers
@@ -1237,8 +1052,8 @@ void update_virtual_cursor(bool fg_ours) {
         g_soft_cursor = false;
         return;
     }
-    const float maxx = g_back_w > 1 ? g_back_w - 1.0f : 0.0f;
-    const float maxy = g_back_h > 1 ? g_back_h - 1.0f : 0.0f;
+    const float maxx = present::g_back_w > 1 ? present::g_back_w - 1.0f : 0.0f;
+    const float maxy = present::g_back_h > 1 ? present::g_back_h - 1.0f : 0.0f;
     CURSORINFO ci{};
     ci.cbSize = sizeof(ci);
     const bool os_visible = GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) != 0;
@@ -1266,10 +1081,10 @@ void update_virtual_cursor(bool fg_ours) {
         // position while deltas keep arriving -- that must not read as a pin.
         // ER's pin target is the screen centre, i.e. always interior.
         const bool interior =
-            p.x > g_canvas_pos.x + 2 &&
-            p.x < g_canvas_pos.x + g_client_w - 3 &&
-            p.y > g_canvas_pos.y + 2 &&
-            p.y < g_canvas_pos.y + g_client_h - 3;
+            p.x > present::g_canvas_pos.x + 2 &&
+            p.x < present::g_canvas_pos.x + static_cast<LONG>(present::g_back_w) - 3 &&
+            p.y > present::g_canvas_pos.y + 2 &&
+            p.y < present::g_canvas_pos.y + static_cast<LONG>(present::g_back_h) - 3;
         if (interior) {
             g_live_raw += std::fabs(g_raw_dx) + std::fabs(g_raw_dy);
             if (g_live_seen)
@@ -1280,7 +1095,7 @@ void update_virtual_cursor(bool fg_ours) {
             if (g_live_raw >= 200.0f) {
                 if (g_live_moved < 4.0f) {
                     g_free_cursor_dead = true;
-                    flog("[overlay] [WARN] free-cursor check failed (mouse moved, "
+                    flog("[overlay-legacy] [WARN] free-cursor check failed (mouse moved, "
                          "OS cursor didn't -- an unhooked pin is active); using "
                          "raw-delta integration for this open");
                 }
@@ -1294,10 +1109,8 @@ void update_virtual_cursor(bool fg_ours) {
     if (use_os_pos) {
         if (os_visible) ++g_cursor_os_visible_frames;
         else ++g_cursor_free_trusted_frames;
-        const float sx = g_client_w > 0 ? static_cast<float>(g_back_w) / g_client_w : 1.0f;
-        const float sy = g_client_h > 0 ? static_cast<float>(g_back_h) / g_client_h : 1.0f;
-        g_vmx = std::clamp(static_cast<float>(p.x - g_canvas_pos.x) * sx, 0.0f, maxx);
-        g_vmy = std::clamp(static_cast<float>(p.y - g_canvas_pos.y) * sy, 0.0f, maxy);
+        g_vmx = std::clamp(static_cast<float>(p.x - present::g_canvas_pos.x), 0.0f, maxx);
+        g_vmy = std::clamp(static_cast<float>(p.y - present::g_canvas_pos.y), 0.0f, maxy);
         g_raw_dx = g_raw_dy = 0.0f; // drain so nothing replays on a source switch
         g_raw_ax = g_raw_ay = -1.0f;
     } else {
@@ -1305,14 +1118,12 @@ void update_virtual_cursor(bool fg_ours) {
         // Fallback: the unpin hook never landed, g_scp_blocks is still 0 (the
         // game hasn't tried to warp yet this open, or warps through a
         // mechanism we didn't hook), or the liveness check tripped --
-        // integrate raw deltas, scaled by g_mouse_scale to match the user's
-        // configured Windows pointer speed. The absolute-device branch is NOT
-        // scaled -- those are positions, not deltas.
+        // integrate raw deltas, scaled by g_mouse_scale (2.1) to match the
+        // user's configured Windows pointer speed. The absolute-device branch
+        // is NOT scaled -- those are positions, not deltas.
         if (g_raw_ax >= 0.0f) { // absolute device (tablet / RDP) moved last
-            const float sx = g_client_w > 0 ? static_cast<float>(g_back_w) / g_client_w : 1.0f;
-            const float sy = g_client_h > 0 ? static_cast<float>(g_back_h) / g_client_h : 1.0f;
-            g_vmx = std::clamp((g_raw_ax - static_cast<float>(g_canvas_pos.x)) * sx, 0.0f, maxx);
-            g_vmy = std::clamp((g_raw_ay - static_cast<float>(g_canvas_pos.y)) * sy, 0.0f, maxy);
+            g_vmx = std::clamp(g_raw_ax - static_cast<float>(present::g_canvas_pos.x), 0.0f, maxx);
+            g_vmy = std::clamp(g_raw_ay - static_cast<float>(present::g_canvas_pos.y), 0.0f, maxy);
             g_raw_ax = g_raw_ay = -1.0f;
         } else {
             g_vmx = std::clamp(g_vmx + g_raw_dx * g_mouse_scale, 0.0f, maxx);
@@ -1360,39 +1171,10 @@ void update_menu_toggle() {
 
     if (toggled) {
         const bool next_open = !g_menu_open.load();
-        if (next_open && !refresh_canvas()) {
-            static ULONGLONG last_not_ready_log = 0;
-            const ULONGLONG now = GetTickCount64();
-            if (now - last_not_ready_log > 2000) {
-                flog("[overlay-v2] menu requested before a validated game "
-                     "swapchain was ready: %s",
-                     g_canvas_block_reason ? g_canvas_block_reason
-                                           : "reason unrecorded");
-                last_not_ready_log = now;
-            }
-            toggled = false;
-        }
-        // Only one overlay in the process may capture input at a time: the
-        // raw-input registration is a per-process singleton and each overlay's
-        // close restores the snapshot it took at open. Two open at once means
-        // the second snapshotted the first's sink hwnd, and a close-order
-        // inversion hands the game a dead sink -- no keyboard, no mouse. Take
-        // ownership BEFORE publishing the open so a refusal leaves the state
-        // machine untouched (overlay_coexist.hpp).
-        if (toggled && next_open && !coexist::acquire_menu_ownership()) {
-            static ULONGLONG last_busy_log = 0;
-            const ULONGLONG now = GetTickCount64();
-            if (now - last_busy_log > 2000) {
-                flog("[overlay] another overlay in this process has its menu "
-                     "open; refusing to open (close it first)");
-                last_busy_log = now;
-            }
-            toggled = false;
-        }
         // Cursor hooks persist after their first install. Reset the proof
         // counter BEFORE publishing a later open, or a game thread can enter
         // an already-live detour and have its first block erased afterwards.
-        if (toggled && next_open) {
+        if (next_open) {
             g_scp_blocks.store(0, std::memory_order_relaxed);
             // Fresh liveness verdict each open (display mode / pin behavior
             // can change between opens).
@@ -1400,7 +1182,7 @@ void update_menu_toggle() {
             g_live_seen = false;
             g_live_raw = g_live_moved = 0.0f;
         }
-        if (toggled) g_menu_open.store(next_open);
+        g_menu_open.store(next_open);
     }
 
     static bool prev_esc = false, prev_padb = false;
@@ -1422,60 +1204,86 @@ void update_menu_toggle() {
     static bool prev_open = false;
     const bool open_now = g_menu_open.load();
     if (open_now && !prev_open) {
-        // Opening changes only input routing plus one atomic render-visible bit.
-        // There is no top-level HWND to show, activate, resize, or place in the
-        // z-order, and no DXGI object is recreated.
-        refresh_canvas();
+        // Cover the game first (so we open at the right place/size), make the
+        // window hit-testable, and redirect raw input to us. The game KEEPS
+        // foreground focus and our window never changes visibility: neither the
+        // game's activation nor its presentation state changes, so frame-gen
+        // pipelines don't re-init and DXGI-fullscreen games (ER in HDR) don't
+        // get kicked out of fullscreen.
+        present::update_frame_period(); // pace the open loop to this monitor's refresh
+        present::reset_open_telemetry();
         g_cursor_os_visible_frames = 0;
         g_cursor_free_trusted_frames = 0;
         g_cursor_integration_frames = 0;
-        g_raw_key_events = 0;
-        g_text_characters = 0;
-        g_search_activated = false;
-        g_imgui_focus_known = false;
-        ui::update_scale(static_cast<int>(g_back_h));
+        int gw = 0, gh = 0;
+        present::track_game_canvas(gw, gh);
+        if (gw > 0 && gh > 0 &&
+            (static_cast<UINT>(gw) != present::g_back_w ||
+             static_cast<UINT>(gh) != present::g_back_h))
+            present::resize_seh(static_cast<UINT>(gw), static_cast<UINT>(gh));
+        ui::update_scale(gh); // resolution-based overlay scale (4K readability)
+        // Re-assert topmost z-order once per open (an overlay window created
+        // after ours would otherwise sit above the panel). Once, not per-frame:
+        // per-frame re-asserts churn DWM and fight other topmost overlays.
+        SetWindowPos(present::g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        present::set_click_through(false);
+        g_fg_lost_since = 0;         // fresh foreground-loss debounce this open
+        g_bg_click_through = false;
         hook_xinput();       // install/refresh pad detours LAST-hooked = outermost
         hook_dinput8();      // no-op if already hooked; retry if dinput8 loaded late
-        hook_cursor_unpin(); // no-op if already hooked (unpins the OS cursor)
+        hook_cursor_unpin(); // no-op if already hooked (2.3: unpins the OS cursor)
         { // fresh freeze-frames for custom-format devices this session
             std::lock_guard<std::mutex> lk(g_di_mutex);
             g_joy_frozen.clear();
         }
         raw_input_capture(true);
-        g_mouse_scale = mouse_speed_multiplier(); // match Windows pointer speed
+        g_mouse_scale = mouse_speed_multiplier(); // 2.1: match Windows pointer speed
         // Seed the virtual cursor from the OS position (during gameplay the
         // game parks the hidden cursor mid-screen -- a fine starting spot);
         // update_virtual_cursor drives it from here.
         POINT p{};
         if (GetCursorPos(&p)) {
-            const float sx = g_client_w > 0 ? static_cast<float>(g_back_w) / g_client_w : 1.0f;
-            const float sy = g_client_h > 0 ? static_cast<float>(g_back_h) / g_client_h : 1.0f;
-            g_vmx = std::clamp(static_cast<float>(p.x - g_canvas_pos.x) * sx, 0.0f,
-                               g_back_w > 1 ? g_back_w - 1.0f : 0.0f);
-            g_vmy = std::clamp(static_cast<float>(p.y - g_canvas_pos.y) * sy, 0.0f,
-                               g_back_h > 1 ? g_back_h - 1.0f : 0.0f);
+            g_vmx = std::clamp(static_cast<float>(p.x - present::g_canvas_pos.x), 0.0f,
+                               present::g_back_w > 1 ? present::g_back_w - 1.0f : 0.0f);
+            g_vmy = std::clamp(static_cast<float>(p.y - present::g_canvas_pos.y), 0.0f,
+                               present::g_back_h > 1 ? present::g_back_h - 1.0f : 0.0f);
         }
         g_raw_dx = g_raw_dy = 0.0f;
         g_raw_ax = g_raw_ay = -1.0f;
-        present::set_visible(true);
     } else if (!open_now && prev_open) {
-        present::set_visible(false);
+        // Blank to one fully-transparent frame and go click-through; the
+        // window stays SHOWN (hiding uncovers the game -> DWM present-mode
+        // transition) and the game never lost focus, so gameplay resumes
+        // instantly -- no frozen-frame stall. The alpha-0 frame is per-pixel
+        // input-transparent, so the closed window can't steal cursor/clicks.
+        if (!present::render_frame(false)) {
+            // A failed update must never leave the panel photo behind.
+            // Force one retry through the proven explicit full establish path.
+            present::force_full_reestablish();
+            present::render_frame(false);
+        }
         const uint32_t final_scp_blocks =
             g_scp_blocks.load(std::memory_order_relaxed);
-        flog("[overlay-v2] menu closed; cursor sources: %d os-visible, %d free-trusted, "
-             "%d integration, scp_blocks=%u, free_cursor_dead=%s; "
-             "input: raw_keys=%u, text_chars=%u, search_active=%s",
+        flog("[overlay-legacy] presents this open: %d attempted, %d landed (%d full), "
+             "%d failed; cursor sources: %d os-visible, %d free-trusted, "
+             "%d integration, scp_blocks=%u, free_cursor_dead=%s",
+             present::g_presents_attempted, present::g_presents_landed,
+             present::g_present_full_reestablishes, present::g_present_failed_updates,
              g_cursor_os_visible_frames, g_cursor_free_trusted_frames,
              g_cursor_integration_frames, final_scp_blocks,
-             g_free_cursor_dead ? "yes" : "no", g_raw_key_events,
-             g_text_characters, g_search_activated ? "yes" : "no");
+             g_free_cursor_dead ? "yes" : "no");
+        present::set_click_through(true);
+        g_fg_lost_since = 0;         // closed: the open-state safety net is moot
+        g_bg_click_through = false;
         raw_input_capture(false); // give the game its raw input back
-        // Cursor confinement teardown. Order vs raw_input_capture(false) above
-        // doesn't matter functionally -- kept together here as one tidy close
-        // block. Release our clip, replaying whatever the game last asked for
-        // while we were swallowing its ClipCursor calls (it re-asserts its own
-        // pin/clip within a frame once its calls pass through again, but
-        // replaying immediately avoids a stray frame of a wide-open cursor).
+        // Cursor confinement teardown (2.3). Order vs raw_input_capture(false)
+        // above doesn't matter functionally -- kept together here as one tidy
+        // close block. Release our clip, replaying whatever the game last
+        // asked for while we were swallowing its ClipCursor calls (it
+        // re-asserts its own pin/clip within a frame once its calls pass
+        // through again, but replaying immediately avoids a stray frame of a
+        // wide-open cursor).
         {
             RECT replay{};
             bool have_replay = false;
@@ -1486,287 +1294,326 @@ void update_menu_toggle() {
                 g_game_clip_valid = false;
             }
             if (!real_clip(have_replay ? &replay : nullptr))
-                flog("[overlay] [WARN] cursor clip restore failed (err %lu)",
+                flog("[overlay-legacy] [WARN] cursor clip restore failed (err %lu)",
                      GetLastError());
             g_clip_applied = false;
             g_scp_blocks.store(0, std::memory_order_relaxed);
         }
-        ui::reset_on_close();
-        // Last: raw input and the cursor clip are back with the game above, so
-        // another overlay taking ownership now snapshots the GAME's state, not
-        // ours (overlay_coexist.hpp).
-        coexist::release_menu_ownership();
+        ui::reset_on_close();     // reopen on the quest list, not Settings
         std::lock_guard<std::mutex> l(g_state_mutex);
-        g_state.save_requested = true; // auto-save selections on close
+        g_state.save_requested = true; // auto-save options on close
     }
     prev_open = open_now;
 }
 
 // ── the overlay thread ──
 void overlay_thread() {
-    if (!create_input_window()) {
-        flog("[overlay-v2] [ERROR] message-only input window creation failed");
-        return;
-    }
-    if (!init_frontend()) {
-        flog("[overlay-v2] [ERROR] ImGui frontend initialization failed");
-        return;
+    if (!present::create_window()) return;
+
+    if (!present::init_d3d_seh()) {
+        flog("[overlay-legacy] D3D11 init failed; overlay disabled");
+        return; // teardown() (below) releases the window
     }
     g_context_ready = true;
-    ImGui::SetCurrentContext(g_imgui_context);
 
-    bool ever_had_canvas = false;
-    bool canvas_loss_reported = false;
-    ULONGLONG canvas_lost_since = 0;
-    ULONGLONG open_unavailable_since = 0;
-    UINT last_scaled_height = 0;
+    // Menu starts closed: commit one alpha-0 frame (a layered window shows
+    // nothing until its first UpdateLayeredWindow), then keep the window SHOWN
+    // for the mod's lifetime. The alpha-0 frame is per-pixel input-transparent,
+    // so the closed window holds the game's DWM presentation steady without
+    // intercepting cursor or clicks -- and since visibility never changes,
+    // open/close can't trigger present-mode transitions, frame-gen re-inits,
+    // or DXGI fullscreen-occlusion kicks (the HDR minimize-to-icon bug).
+    present::set_click_through(true);
+    present::render_frame(false); // commit one fully-transparent frame
+    ShowWindow(present::g_hwnd, SW_SHOWNOACTIVATE);
 
-    // Swapchain discovery is creation-first: the DXGI creation detours are
-    // the authoritative path (they capture the exact queue at creation). But
-    // that call can be missed -- a delayed loader/injector starts this mod
-    // after the game is already presenting, or a peer mod's unserialized
-    // install erases the creation hook (hooks.hpp). Both are recovered by
-    // present::arm_adoption(), which finds the live swapchain from
-    // pass-through Present observers and shadows it in place. Trigger it
-    // immediately when the game window predates the hooks, or from a 10s
-    // watchdog otherwise; forensics lines attribute the cause either way.
-    const ULONGLONG discovery_started = GetTickCount64();
-    bool discovery_stall_handled = false;
-    bool canvas_loss_adoption_armed = false;
-    // A visible game window here proves nothing on its own: bootstrap does
-    // config and flag-scanner work between installing the hooks and reaching
-    // this point, so the game can legitimately create AND present its
-    // swapchain in that gap. Only a window with no observed creation is a real
-    // late load. Arming adoption otherwise costs three extra process-wide
-    // detours and can never help anyway -- try_adopt_swapchain rejects any
-    // chain that already carries a shadow.
-    if (HWND existing = find_existing_game_window()) {
-        if (present::observed_swapchain_creation()) {
-            flog("[overlay-v2] game window already up, but the overlay observed "
-                 "its swapchain creation; adoption not needed");
-        } else {
-            flog("[overlay-v2] late load detected: the game window predates "
-                 "this mod's DXGI hooks; adopting the live swapchain");
-            present::log_creation_hook_forensics();
-            present::arm_adoption(existing);
-            discovery_stall_handled = true;
-        }
-    }
-
-    while (g_running.load(std::memory_order_acquire)) {
+    while (g_running.load()) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
-        const bool canvas_valid = refresh_canvas();
-        if (canvas_valid) {
-            ever_had_canvas = true;
-            canvas_lost_since = 0;
-            canvas_loss_adoption_armed = false;
-            if (canvas_loss_reported) {
-                flog("[overlay-v2] game swapchain/window reacquired");
-                canvas_loss_reported = false;
+        // Track the game window every tick (not only while covering) so the
+        // shutdown check below works even if the menu was never opened.
+        present::find_game_window();
+
+        // Once-per-transition diagnostics: a DXGI-fullscreen game being
+        // minimized under us (the HDR fullscreen-kick class of bug) or the
+        // foreground moving away is exactly what past regressions looked
+        // like from the user's chair -- make the log tell that story instead
+        // of leaving "the game minimized" with nothing to go on.
+        {
+            static int was_iconic = -1, was_fg = -1;
+            const int ic = (present::g_game_hwnd && IsWindow(present::g_game_hwnd) &&
+                            IsIconic(present::g_game_hwnd)) ? 1 : 0;
+            if (ic != was_iconic) {
+                if (was_iconic != -1 || ic)
+                    flog("[overlay-legacy] game window %s (menu %s)",
+                         ic ? "MINIMIZED" : "restored",
+                         g_menu_open.load() ? "open" : "closed");
+                was_iconic = ic;
             }
-        } else if (ever_had_canvas) {
-            if (!canvas_lost_since) canvas_lost_since = GetTickCount64();
-            if (GetTickCount64() - canvas_lost_since > 3000 &&
-                !canvas_loss_reported) {
-                flog("[overlay-v2] game swapchain/window unavailable; waiting for replacement");
-                g_menu_open.store(false, std::memory_order_release);
-                canvas_loss_reported = true;
+            const int fg = foreground_is_ours() ? 1 : 0;
+            if (fg != was_fg) {
+                if (was_fg != -1)
+                    flog("[overlay-legacy] foreground %s (menu %s)",
+                         fg ? "returned to the game" : "left the game",
+                         g_menu_open.load() ? "open" : "closed");
+                was_fg = fg;
             }
-            // A replacement swapchain normally re-registers through the
-            // creation detour within a frame or two. If it still has not
-            // after 5s, assume the creation call was missed again (dead
-            // creation hook) and search the live presents instead.
-            if (GetTickCount64() - canvas_lost_since > 5000 &&
-                !canvas_loss_adoption_armed) {
-                canvas_loss_adoption_armed = true;
-                flog("[overlay-v2] replacement swapchain never registered; "
-                     "engaging live-swapchain adoption");
-                present::log_creation_hook_forensics();
-                present::arm_adoption(find_existing_game_window());
-            }
-        } else if (!discovery_stall_handled &&
-                   GetTickCount64() - discovery_started > 10000) {
-            discovery_stall_handled = true;
-            if (present::observed_swapchain_creation()) {
-                // Discovery worked; validation or presentation did not. The
-                // one-shot backend diagnostics name the gate -- adoption
-                // cannot help, because the chain is already shadowed.
-                flog("[overlay-v2] [WARN] no usable canvas 10s after "
-                     "bootstrap even though the overlay observed and shadowed "
-                     "the swapchain creation -- validation is rejecting it");
+        }
+
+        // Game shutdown detection: when the game window dies but the process
+        // lingers (me3 keeps it alive during teardown), our always-shown
+        // topmost window would keep sitting over the desktop and leave it
+        // unresponsive until the process finally exits. Give the game a short
+        // grace period to recreate its window (display-mode changes do that),
+        // then tear the overlay down for good.
+        static ULONGLONG dead_since = 0;
+        if (present::g_game_hwnd && !IsWindow(present::g_game_hwnd)) {
+            present::g_game_hwnd = nullptr; // stale; find_game_window may re-adopt
+            dead_since = GetTickCount64();
+            // A dead game window cannot re-assert its own clip. Always release
+            // -- the game's last clip can exist even if our g_clip_applied
+            // bookkeeping is false.
+            if (real_clip(nullptr)) g_clip_applied = false;
+            // The game window is gone: there is nothing left to keep steady, so
+            // drop our always-shown topmost window IMMEDIATELY rather than waiting
+            // out the grace -- otherwise it covers the desktop and locks it until
+            // the process finally exits (me3 lingers). Safe on both paths: no
+            // game window means no DWM/frame-gen state to protect.
+            ShowWindow(present::g_hwnd, SW_HIDE);
+            flog("[overlay-legacy] game window died -- overlay hidden, grace before teardown");
+        }
+        if (dead_since) {
+            // Only cancel teardown if a REAL game window came back (a display-mode
+            // change recreates it). A transient or hidden process window during
+            // me3 shutdown must not keep resetting the grace timer forever, or the
+            // thread never exits.
+            HWND back = present::find_game_window();
+            RECT cr{};
+            const bool real = back && IsWindow(back) && IsWindowVisible(back) &&
+                              GetClientRect(back, &cr) &&
+                              (cr.right - cr.left) > 0 && (cr.bottom - cr.top) > 0;
+            if (real) {
+                dead_since = 0; // window came back (display-mode change)
+                flog("[overlay-legacy] game window re-adopted -- overlay restored");
+                ShowWindow(present::g_hwnd, SW_SHOWNOACTIVATE); // always-shown design
             } else {
-                flog("[overlay-v2] [WARN] no game swapchain discovered 10s "
-                     "after bootstrap -- this mod's DXGI creation detour "
-                     "never saw the creation call; engaging live-swapchain "
-                     "adoption");
-                present::log_creation_hook_forensics();
-                present::arm_adoption(find_existing_game_window());
+                // ClipCursor can fail transiently while the input desktop is
+                // changing. Retry during the death grace so the desktop cannot
+                // remain trapped if the first release lost that race.
+                if (real_clip(nullptr))
+                    g_clip_applied = false;
+                if (GetTickCount64() - dead_since > 3000) {
+                    flog("[overlay-legacy] game window gone -- removing overlay window");
+                    g_menu_open.store(false);
+                    break; // -> teardown() destroys our window; thread exits
+                }
+            }
+        }
+
+        // Minimized-game safety net: two continuous seconds minimized closes
+        // through update_menu_toggle below, which blanks the always-shown
+        // window and restores input without any hide/show cycle.
+        {
+            static ULONGLONG minimized_since = 0;
+            const bool minimized_open = g_menu_open.load() &&
+                present::g_game_hwnd && IsWindow(present::g_game_hwnd) &&
+                IsIconic(present::g_game_hwnd);
+            if (minimized_open) {
+                const ULONGLONG now = GetTickCount64();
+                if (!minimized_since) {
+                    minimized_since = now;
+                } else if (now - minimized_since > 2000) {
+                    flog("[overlay-legacy] game window minimized for >2s -- closing menu");
+                    g_menu_open.store(false);
+                    minimized_since = 0;
+                }
+            } else {
+                minimized_since = 0;
             }
         }
 
         poll_gamepad();
         update_menu_toggle();
 
-        if (g_menu_open.load(std::memory_order_acquire)) {
-            if (!canvas_valid || !present::renderer_healthy()) {
+        if (g_menu_open.load()) {
+            // Only do GPU work (resize + render + present) while the menu is
+            // open. Keep the canvas tracking the game's client area.
+            int gw = 0, gh = 0;
+            present::track_game_canvas(gw, gh);
+            if (gw > 0 && gh > 0 &&
+                (static_cast<UINT>(gw) != present::g_back_w ||
+                 static_cast<UINT>(gh) != present::g_back_h))
+                present::resize_seh(static_cast<UINT>(gw), static_cast<UINT>(gh));
+
+            // Foreground check for this frame: alt-tabbed / on another monitor
+            // the OS cursor is visible again, so drawing our software cursor too
+            // shows TWO pointers; raw input is likewise ignored then (see
+            // handle_raw_input), the pad is fed neutral so no key stays held, and
+            // (2.3 below) the confinement clip is released rather than applied.
+            const bool fg_ours = foreground_is_ours();
+            const bool canvas_valid = dead_since == 0 && gw > 0 && gh > 0 &&
+                                      present::g_game_hwnd && IsWindow(present::g_game_hwnd);
+
+            // Open-menu foreground-loss safety net (see g_fg_lost_since): the
+            // window must never swallow another app's (or the desktop's)
+            // clicks. Only touches the style on a state CHANGE -- never per
+            // frame (set_click_through does a SetWindowPos).
+            if (!fg_ours) {
                 const ULONGLONG now = GetTickCount64();
-                if (!open_unavailable_since) open_unavailable_since = now;
-                if (now - open_unavailable_since > 1500) {
-                    flog("[overlay-v2] renderer/canvas unavailable for 1.5s; restoring input");
-                    g_menu_open.store(false, std::memory_order_release);
+                if (!g_fg_lost_since) {
+                    g_fg_lost_since = now;
+                } else if (!g_bg_click_through && now - g_fg_lost_since > 300) {
+                    present::set_click_through(true);
+                    g_bg_click_through = true;
+                    flog("[overlay-legacy] menu open but game lost foreground -- "
+                         "click-through until it returns");
                 }
-                Sleep(8);
-                continue;
-            }
-            open_unavailable_since = 0;
-
-            // Re-apply automatic UI scaling only when the actual backbuffer
-            // height changes (a mid-session resolution/display-mode switch).
-            // This mod never causes that resize.
-            if (last_scaled_height != g_back_h) {
-                ui::update_scale(static_cast<int>(g_back_h));
-                last_scaled_height = g_back_h;
+            } else {
+                g_fg_lost_since = 0;
+                if (g_bg_click_through) {
+                    present::set_click_through(false);
+                    g_bg_click_through = false;
+                }
             }
 
-            const bool foreground = foreground_is_ours();
-            if (foreground) {
-                const RECT wanted{
-                    g_canvas_pos.x,
-                    g_canvas_pos.y,
-                    g_canvas_pos.x + g_client_w,
-                    g_canvas_pos.y + g_client_h};
+            // Cursor confinement (2.3): once the OS cursor is unpinned (see
+            // hook_cursor_unpin), it's genuinely free to move -- which means it
+            // could wander onto a second monitor and clicks would land in
+            // another app. While we have the game covered, keep it clipped to
+            // the game's canvas. Only touches ClipCursor when the desired rect
+            // actually changed (or wasn't applied yet), not every frame; goes
+            // through the TRAMPOLINE (real_clip) so this call isn't swallowed
+            // right back by our own clip_detour (g_menu_open is still true here).
+            if (fg_ours && canvas_valid) {
+                const RECT want{present::g_canvas_pos.x, present::g_canvas_pos.y,
+                                present::g_canvas_pos.x + static_cast<LONG>(present::g_back_w),
+                                present::g_canvas_pos.y + static_cast<LONG>(present::g_back_h)};
                 if (!g_clip_applied ||
-                    std::memcmp(&wanted, &g_clip_rect_applied, sizeof(RECT)) != 0) {
-                    if (real_clip(&wanted)) {
+                    std::memcmp(&want, &g_clip_rect_applied, sizeof(RECT)) != 0) {
+                    if (real_clip(&want)) {
                         g_clip_applied = true;
-                        g_clip_rect_applied = wanted;
+                        g_clip_rect_applied = want;
                     }
                 }
             } else if (g_clip_applied) {
+                // A lost foreground or invalid/dead canvas must not keep the
+                // cursor trapped. Preserve the applied bit on failure so the
+                // next frame retries instead of forgetting the clip.
                 if (real_clip(nullptr)) g_clip_applied = false;
             }
 
-            raw_input_reassert();
+            raw_input_reassert(); // keep kb/mouse routed to us (game may re-register)
 
-            ImGui::SetCurrentContext(g_imgui_context);
-            if (!g_imgui_focus_known || g_imgui_focused != foreground) {
-                // ImGui must know whether its private canvas is usable, but the
-                // message-only input sink can never receive WM_SETFOCUS. Mirror
-                // process foreground state without changing any native focus.
-                ImGui::GetIO().AddFocusEvent(foreground);
-                g_imgui_focused = foreground;
-                g_imgui_focus_known = true;
-            }
+            ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
-            ImGuiIO& io = ImGui::GetIO();
-            io.DisplaySize = ImVec2(static_cast<float>(g_back_w),
-                                    static_cast<float>(g_back_h));
-            io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
-            if (foreground) feed_gamepad(); else feed_gamepad_neutral();
-            update_modifiers();
-            update_virtual_cursor(foreground);
+            // Reinforce the logical canvas from our D3D targets; the layered
+            // window itself remains the same full-canvas size between presents.
+            ImGui::GetIO().DisplaySize = ImVec2(static_cast<float>(present::g_back_w),
+                                                static_cast<float>(present::g_back_h));
+            if (fg_ours) feed_gamepad(); else feed_gamepad_neutral();
+            update_modifiers(); // hardware truth; backend's GetKeyState is stale here
+            update_virtual_cursor(fg_ours); // OS cursor = pointer position + visibility
             ImGui::NewFrame();
-            io.MouseDrawCursor = g_soft_cursor;
-
-            ui::Frame frontend_frame;
-            frontend_frame.canvas_w = static_cast<float>(g_back_w);
-            frontend_frame.canvas_h = static_cast<float>(g_back_h);
-            frontend_frame.pad_connected = g_pad_ok;
-            frontend_frame.pad_buttons = g_pad_ok ? g_pad.wButtons : 0;
-            frontend_frame.open_pad_mask = g_open_pad_mask;
-            const ui::Result result = ui::draw(frontend_frame);
-            g_search_activated = g_search_activated || result.search_active;
-            if (result.close_requested)
-                g_menu_open.store(false, std::memory_order_release);
-
+            // Software cursor ONLY when the OS cursor is hidden -- one pointer.
+            ImGui::GetIO().MouseDrawCursor = g_soft_cursor;
+            {
+                ui::Frame uf;
+                uf.canvas_w = static_cast<float>(present::g_back_w);
+                uf.canvas_h = static_cast<float>(present::g_back_h);
+                uf.pad_connected = g_pad_ok;
+                uf.pad_buttons = g_pad_ok ? g_pad.wButtons : 0;
+                uf.open_pad_mask = g_open_pad_mask;
+                // Applied before Render(), i.e. exactly where the panel used to
+                // store the flag itself -- same tick, same ordering.
+                const ui::Result r = ui::draw(uf);
+                if (r.close_requested) g_menu_open.store(false);
+            }
             ImGui::Render();
-            present::publish_draw_data(ImGui::GetDrawData());
-
-            // UI construction is decoupled from GPU presentation.  125 Hz keeps
-            // input responsive while avoiding a busy control thread; every game
-            // Present composites the latest immutable packet.
-            Sleep(8);
+            // Present only when the frame differs from what is already on
+            // screen, and at most ~90 Hz. Static frames cost one hash pass --
+            // no GPU render, no staging readback, no UpdateLayeredWindow, no
+            // DWM recompose -- which is where the open-menu FPS drop lived.
+            {
+                static std::chrono::steady_clock::time_point last_present{};
+                static std::chrono::steady_clock::time_point last_attempt{};
+                const uint64_t h = present::draw_data_hash();
+                const auto now = std::chrono::steady_clock::now();
+                const auto throttle_from =
+                    last_attempt > last_present ? last_attempt : last_present;
+                if (h != present::g_present_hash &&
+                    now - throttle_from >= std::chrono::microseconds(11'000)) {
+                    // Throttle attempts independently: on failure the hash and
+                    // last successful-present time deliberately stay stale so
+                    // the next tick retries, but it must not become a hot loop.
+                    last_attempt = now;
+                    if (present::render_frame(true)) {
+                        present::g_present_hash = h;
+                        last_present = now;
+                    }
+                }
+            }
+            present::pace_frame(); // no vsync on this path; don't spin against the game
         } else {
-            open_unavailable_since = 0;
-            if (g_raw_captured) raw_input_capture(false);
-            Sleep(16);
+            // Menu closed -> our window stays SHOWN but holds its last committed
+            // fully-transparent frame (see update_menu_toggle), so it's invisible
+            // and click-through while keeping the game covered/composited.
+            // Deliberately do NO GPU work here: no Present, no ResizeBuffers. A
+            // thread suspended mid-Present holds a driver/DXGI lock, and when
+            // another mod installs its own hooks via MinHook (which suspends
+            // EVERY thread to patch code) while needing that same lock, the
+            // game deadlocks/freezes on startup. Idling here keeps this thread
+            // safe to suspend and cuts pointless GPU churn. The first open frame
+            // re-covers + resizes before drawing, so nothing is stale.
+            if (g_raw_captured) raw_input_capture(false); // retry a failed restore
+            Sleep(32);
         }
     }
-
-    g_menu_open.store(false, std::memory_order_release);
-    present::set_visible(false);
-    // The loop exited without passing through the close edge, so ownership is
-    // still ours. Hand it back on the acquiring thread while we still are it --
-    // a Windows mutex cannot be released from anywhere else, and leaking it
-    // would lock every other overlay in the process out until this DLL's
-    // handle closes.
-    if (g_raw_captured) raw_input_capture(false);
-    coexist::release_menu_ownership();
 }
 
-// Keep SEH in a POD-only wrapper so an unexpected control-thread fault cannot
-// leave input capture active. Graphics hooks remain fail-open/pass-through.
+// Keep SEH in a POD-only wrapper so an unexpected overlay-thread fault cannot
+// bypass teardown and strand the always-on-top window over the desktop.
 void seh_overlay_thread() {
     __try {
         overlay_thread();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        flog("[overlay] [ERROR] overlay thread crashed -- tearing down");
+        flog("[overlay-legacy] [ERROR] overlay thread crashed -- tearing down");
     }
 }
 
 // ── best-effort teardown (the process usually just exits) ──
 void teardown() {
-    present::set_visible(false);
-    g_context_ready = false;
-    raw_input_capture(false); // first restore attempt while the sink is alive
+    g_context_ready = false;  // stop feeding raw input at a dying ImGui context
+    raw_input_capture(false); // never leave the game's raw input starved
     real_clip(nullptr);       // never leave the desktop cursor trapped in the canvas
     g_clip_applied = false;
-    shutdown_frontend();
     present::shutdown();
-
-    // RegisterRawInputDevices can fail transiently. Exiting this owner thread
-    // while the process registration still targets g_input_hwnd would destroy
-    // that HWND and leave raw input pointed at a dead sink. Keep the
-    // message-only window alive and retry instead; process termination can
-    // still end the thread normally.
-    while (g_raw_captured && g_input_hwnd && IsWindow(g_input_hwnd)) {
-        MSG message{};
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-        Sleep(100);
-        raw_input_capture(false);
-    }
-    destroy_input_window();
 }
 
 } // namespace
 
-// ── the public surface (overlay.hpp) ──
+// ── what overlay_legacy_present.cpp's WndProc asks of this layer
+//    (overlay_legacy_input.hpp) ──
 
-bool overlay::bootstrap() {
-    g_mh_ok = hooks::init();
-    if (!g_mh_ok) {
-        flog("[overlay-v2] [ERROR] hook engine initialization failed");
-        return false;
-    }
-    return present::install_hooks();
-}
+namespace overlay_legacy::input {
 
-void overlay::sync_open_keys() {
+void on_raw_input(HRAWINPUT h) { handle_raw_input(h); }
+
+} // namespace overlay_legacy::input
+
+// ── the public surface (overlay_legacy.hpp) ──
+
+void overlay_legacy::sync_open_keys() {
     std::lock_guard<std::mutex> lk(g_state_mutex);
     g_open_vk = g_state.open_vk;
     g_open_pad_mask = g_state.open_pad_mask;
     g_open_pad_is_hold = g_state.open_pad_is_hold;
 }
 
-void overlay::setup() {
+void overlay_legacy::setup() {
     sync_open_keys();
 
     // Gamepad. We must both READ the pad (menu nav + the open/close combo) and
@@ -1790,23 +1637,22 @@ void overlay::setup() {
                 pXInputGetState =
                     reinterpret_cast<XInputGetState_t>(GetProcAddress(h, "XInputGetState"));
         if (!pXInputGetState)
-            flog("[overlay] [WARN] XInputGetState not found; gamepad unavailable");
+            flog("[overlay-legacy] [WARN] XInputGetState not found; gamepad unavailable");
 
-        g_mh_ok = g_mh_ok || hooks::init();
+        g_mh_ok = hooks::init();
         if (!g_mh_ok)
-            flog("[overlay] [WARN] MinHook init failed; pad will leak to the game while menu open");
+            flog("[overlay-legacy] [WARN] MinHook init failed; pad will leak to the game while menu open");
         hook_dinput8();
     }
 
-    // Spawn the frontend/control thread. It owns no graphics device or visible
-    // window and never calls Present.
+    // Spawn the dedicated overlay thread (window + D3D11 + ImGui + loop).
     if (g_running.exchange(true)) return; // already running
     std::thread([] {
         seh_overlay_thread();
         teardown();
         g_running.store(false);
     }).detach();
-    flog("[overlay-v2] frontend control thread spawned (message-only input)");
+    flog("[overlay-legacy] separate-window overlay thread spawned (focus-free input)");
 }
 
 } // namespace cte

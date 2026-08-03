@@ -76,6 +76,7 @@ add_library(${PROJECT_NAME} SHARED
     src/hooks.cpp
     src/messages.cpp
     src/session_store.cpp
+    src/icons.cpp
     # Backend v2: overlay.cpp owns input + the frontend producer; immutable
     # frame packets cross to the DXGI hook coordinator and private D3D12
     # command-list renderer. The talisman panel itself lives in overlay_ui.cpp
@@ -90,6 +91,11 @@ add_library(${PROJECT_NAME} SHARED
     src/overlay_d3d12.cpp
     src/overlay_frame.cpp
     src/overlay_ui.cpp
+    # Backend v1 (legacy): opt-in separate transparent window + private D3D11
+    # renderer. Selected with `[overlay_render] renderer = window`; it drives
+    # the same unchanged talisman panel in overlay_ui.cpp.
+    src/overlay_legacy/overlay_legacy.cpp
+    src/overlay_legacy/overlay_legacy_present.cpp
     ${minhook_SOURCE_DIR}/src/buffer.c
     ${minhook_SOURCE_DIR}/src/hook.c
     ${minhook_SOURCE_DIR}/src/trampoline.c
@@ -102,6 +108,8 @@ add_library(${PROJECT_NAME} SHARED
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    # Used only by the opt-in legacy window backend.
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
     # Identity metadata (CompanyName/ProductName/FileVersion/...). Its absence
     # was a direct contributor to the ML-heuristic AV false positives.
     ${CMAKE_CURRENT_BINARY_DIR}/CustomTalismanEffects.rc
@@ -128,7 +136,7 @@ target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
 # dxguid are for the DirectInput8 pad-neutralization detours (GUID_SysKeyboard,
 # the IIDs).
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    libER_static d3d12 dxgi d3dcompiler ole32 dinput8 dxguid)
+    libER_static d3d12 dxgi d3dcompiler ole32 dinput8 dxguid d3d11)
 
 if(MSVC)
   # Exploit-mitigation flags benign commercial software carries and injected

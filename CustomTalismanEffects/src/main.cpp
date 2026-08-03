@@ -34,11 +34,13 @@
 
 #include "game_access.hpp"
 #include "hooks.hpp"
+#include "icons.hpp"
 #include "ini.hpp"
 #include "log.hpp"
 #include "messages.hpp"
 #include "offsets.hpp"
 #include "overlay.hpp"
+#include "overlay_legacy/overlay_legacy.hpp"
 #include "runtime_compat.hpp"
 #include "session_store.hpp"
 #include "state.hpp"
@@ -143,6 +145,28 @@ bool strip_hold_prefix(const std::string& raw, std::string& rest) {
     return true;
 }
 
+// Select exactly one overlay backend before any graphics hook is installed.
+// `ingame` is backend v2 (the game's D3D12 backbuffer); `window` is the
+// legacy fallback (a separate transparent D3D11 window and no graphics hook).
+bool g_use_legacy_overlay = false;
+
+void resolve_renderer(const Ini& ini) {
+    const std::string raw = ini.get_string("overlay_render", "renderer", "");
+    const std::string renderer = normalize(raw);
+    if (renderer.empty() || renderer == "ingame" || renderer == "in game" ||
+        renderer == "in_game" || renderer == "new") {
+        g_use_legacy_overlay = false;
+    } else if (renderer == "window" || renderer == "separate_window" ||
+               renderer == "separate window" || renderer == "legacy" ||
+               renderer == "old") {
+        g_use_legacy_overlay = true;
+    } else {
+        flog("[WARN] unrecognized [overlay_render] renderer \"%s\"; using ingame",
+             raw.c_str());
+        g_use_legacy_overlay = false;
+    }
+}
+
 // Enabled set + options parsed from the .ini (before params resolve).
 struct IniConfig {
     std::unordered_set<std::string> enabled; // normalized talisman names set to 1
@@ -153,6 +177,7 @@ struct IniConfig {
     bool           open_pad_is_hold = false;
     std::string    open_key_label = "Insert"; // raw .ini strings, for the overlay footer
     std::string    open_pad_label = "L3+R3";
+    bool hide_effect_icons = false;
     bool show_descriptions = true;
     int  sort_mode = 0;
     float ui_scale = 0.0f;                  // 0 = auto (from the game's resolution)
@@ -172,6 +197,7 @@ IniConfig load_config(const Ini& ini) {
     c.open_pad_mask = parse_pad_mask(
         c.open_pad_is_hold ? combo_rest : c.open_pad_label,
         XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB);
+    c.hide_effect_icons = ini.get_bool("overlay", "hide_effect_icons", false);
     c.show_descriptions = ini.get_bool("overlay", "show_descriptions", true);
     c.sort_mode = ini.get_int("overlay", "sort_mode", 0);
     const float uis = ini.get_float("overlay", "ui_scale", 0.0f);
@@ -231,6 +257,7 @@ void build_state(const IniConfig& cfg) {
     g_state.open_pad_is_hold = cfg.open_pad_is_hold;
     g_state.open_key_label = cfg.open_key_label;
     g_state.open_pad_label = cfg.open_pad_label;
+    g_state.hide_effect_icons = cfg.hide_effect_icons;
     g_state.show_descriptions = cfg.show_descriptions;
     g_state.sort_mode = cfg.sort_mode;
     g_state.ui_scale = cfg.ui_scale;
@@ -342,13 +369,14 @@ void save_config() {
     std::ifstream in(path);
     if (!in) { flog("[WARN] save: cannot open .ini for read"); return; }
 
-    bool show_descriptions;
+    bool show_descriptions, hide_effect_icons;
     int  sort_mode;
     float ui_scale, px, py, pw, ph;
     std::string open_key_label, open_pad_label;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         show_descriptions = g_state.show_descriptions;
+        hide_effect_icons = g_state.hide_effect_icons;
         sort_mode = g_state.sort_mode;
         ui_scale = g_state.ui_scale;
         open_key_label = g_state.open_key_label;
@@ -384,6 +412,12 @@ void save_config() {
          "; default for NEW characters: 1 = ignore talisman families (stack anything)"},
         {"progression_mode", "0",
          "; default for NEW characters: 1 = only show/apply talismans you currently own"},
+        // Seeded OFF, never from the live value: a self-healing .ini must not be
+        // able to switch this on by itself. The in-place rewrite below persists
+        // the overlay's toggle once the key exists.
+        {"hide_effect_icons", "0",
+         "; 1 = hide the HUD status icons for the effects this mod applies "
+         "(talismans you actually wear keep theirs)"},
         {"show_descriptions", show_descriptions ? "1" : "0",
          "; 1 = show the effect description pane at the bottom of the overlay"},
         {"sort_mode", std::to_string(sort_mode),
@@ -467,6 +501,7 @@ void save_config() {
                 // Only these are editable from the overlay; everything else
                 // (hotkeys, the per-character seed toggles) is left as authored.
                 if (key_norm == "show_descriptions") rewrite(show_descriptions ? "1" : "0");
+                else if (key_norm == "hide_effect_icons") rewrite(hide_effect_icons ? "1" : "0");
                 else if (key_norm == "sort_mode") rewrite(std::to_string(sort_mode));
                 else if (key_norm == "ui_scale") rewrite(ui_scale_val);
             } else if (have_panel) { // [panel]: the overlay owns every value
@@ -645,6 +680,9 @@ void run_loop() {
     std::unordered_set<int> active_set;
     std::unordered_set<int> applied;   // effects WE applied (ours to remove)
     bool warned_no_remove = false;
+    // Level-triggered, and only consumed once a player exists, so a toggle made
+    // at the main menu is still pending when one loads.
+    bool last_hide_icons = false;
 
     // Per-character preset tracking. last_char_key is the currently-loaded
     // character's key (empty = none resolved yet / name-read failed); last_char_name
@@ -705,9 +743,11 @@ void run_loop() {
         std::unordered_set<int> desired;
         bool do_save = false;
         bool do_import = false;
+        bool hide_icons = false;
         std::string import_src;
         {
             std::lock_guard<std::mutex> lk(g_state_mutex);
+            hide_icons = g_state.hide_effect_icons;
             const bool gate = g_state.progression_mode && g_state.possessed_valid;
             for (const auto& t : g_state.talismans) {
                 if (!t.enabled) continue;
@@ -795,10 +835,34 @@ void run_loop() {
             }
         }
 
+        // HUD status icons ([overlay] hide_effect_icons). Reconciled every tick
+        // from `applied` -- the ids WE put on the player -- so a talisman being
+        // untoggled, a character switch, or the tug-of-war giving up on an
+        // effect all fall out for free. Ids that leave `applied` entirely are
+        // restored by the remove block below.
+        if (hide_icons != last_hide_icons) {
+            last_hide_icons = hide_icons;
+            if (hide_icons) flog("icons: hide_effect_icons on");
+            else flog("icons: hide_effect_icons off -- restored %zu icon(s)",
+                      icons::restore_all());
+        }
+        if (hide_icons) {
+            for (int id : applied) {
+                if (!desired.count(id)) continue;            // the remove block owns it
+                if (abandoned.count(id)) icons::restore(id); // another mod owns it now
+                else if (icons::hide(id) && g_log_each)
+                    flog("hid HUD icon for SpEffect %d", id);
+            }
+        }
+
         // Apply: desired effects not currently on the player.
         if (g_apply) {
             for (int id : desired) {
                 if (active_set.count(id) || abandoned.count(id)) continue;
+                // Before the add, not after: if the game latches the icon when
+                // the effect is created, patching afterwards would be a tick late.
+                if (hide_icons && icons::hide(id) && g_log_each)
+                    flog("hid HUD icon for SpEffect %d", id);
                 g_apply(reinterpret_cast<void*>(player), id, 1); // unk=1 == self
                 if (applied.insert(id).second && g_log_each)
                     flog("applied SpEffect %d", id);
@@ -820,6 +884,7 @@ void run_loop() {
                     warned_no_remove = true;
                 }
             }
+            icons::restore(id); // no longer ours -- give its icon back
             it = applied.erase(it);
         }
 
@@ -847,19 +912,19 @@ DWORD WINAPI run(LPVOID) {
     // than logging, input, or swapchain validation.
     runtime_compat::log_environment();
 
-    // FIRST, before anything slow. The overlay backend composites into the
-    // game's own D3D12 backbuffer, and the only safe way to learn the exact
-    // command queue that presents it is to observe the game's CreateSwapChain*
-    // call. That happens early in startup, so these (lightweight, fail-open)
-    // discovery hooks must be installed before config parsing, the compat wait
-    // below, or the param wait -- missing the transaction leaves the overlay
-    // unavailable for the whole session. It installs hooks only; no COM, no
-    // D3D, no device is created here.
-    if (!overlay::bootstrap())
-        flog("[WARN] graphics interception unavailable; the overlay will not be shown");
-
+    // The backend choice must be read before backend v2 installs any graphics
+    // hooks: selecting `window` is specifically the no-graphics-hook fallback.
+    // This one small file read still precedes all scans, waits, and game access.
     Ini ini;
     const bool loaded = ini.load(config_path());
+    resolve_renderer(ini);
+    if (g_use_legacy_overlay) {
+        flog("[overlay] renderer = window ([overlay_render] in the .ini): starting "
+             "the legacy separate-window backend; no graphics hook will be installed");
+    } else if (!overlay::bootstrap()) {
+        flog("[WARN] graphics interception unavailable; the overlay will not be shown");
+    }
+
     g_debug    = ini.get_bool("debugging", "debug_console", false);
     g_log_each = ini.get_bool("debugging", "log_each", false);
     if (g_debug) {
@@ -943,6 +1008,7 @@ DWORD WINAPI run(LPVOID) {
             g_state.open_pad_is_hold = cfg.open_pad_is_hold;
             g_state.open_key_label = cfg.open_key_label;
             g_state.open_pad_label = cfg.open_pad_label;
+            g_state.hide_effect_icons = cfg.hide_effect_icons;
             g_state.show_descriptions = cfg.show_descriptions;
             g_state.sort_mode = cfg.sort_mode;
             g_state.ui_scale = cfg.ui_scale;
@@ -952,15 +1018,15 @@ DWORD WINAPI run(LPVOID) {
             g_state.panel_h = cfg.panel_h;
         }
 
-        // In-game overlay: focus-free input + the packet-producer thread. The
-        // graphics side was already armed by overlay::bootstrap() at the top of
-        // this worker; setup() adds the input detours (dinput8
-        // GetDeviceState/GetDeviceData now, XInput lazily on the first
-        // menu-open) and spawns the control thread. Nothing here creates a
-        // window, device, or swapchain, and the game's Present/queue stay its
-        // own -- safe alongside frame-gen / Special K / erdGameTools.
-        overlay::setup();
-        overlay::sync_open_keys(); // pick up the just-published toggle inputs
+        // Start exactly one backend. Both use the unchanged talisman frontend
+        // and the same focus-free input behavior.
+        if (g_use_legacy_overlay) {
+            overlay_legacy::setup();
+            overlay_legacy::sync_open_keys();
+        } else {
+            overlay::setup();
+            overlay::sync_open_keys();
+        }
 
         flog("waiting for params...");
         from::CS::SoloParamRepository::wait_for_params(-1);
@@ -981,7 +1047,9 @@ DWORD WINAPI run(LPVOID) {
 
         flog("params ready -- building talisman model");
         build_state(cfg);
-        overlay::sync_open_keys(); // setup() ran before build_state(); pick up the real toggle_key/toggle_gamepad_combo now
+        // setup() ran before build_state(); pick up the finalized hotkeys.
+        if (g_use_legacy_overlay) overlay_legacy::sync_open_keys();
+        else                      overlay::sync_open_keys();
 
         // Self-heal the .ini: add any managed [overlay] option this DLL version
         // expects but the file lacks, and evict any option this version has
@@ -992,7 +1060,8 @@ DWORD WINAPI run(LPVOID) {
         if (loaded) {
             static const char* kOverlayKeys[] = {
                 "toggle_key", "toggle_gamepad_combo", "allow_stacking",
-                "progression_mode", "show_descriptions", "sort_mode", "ui_scale",
+                "progression_mode", "hide_effect_icons", "show_descriptions",
+                "sort_mode", "ui_scale",
             };
             static const char* kRetiredKeys[] = {"focus_input"};
             bool needs_migration = false;
